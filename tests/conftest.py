@@ -1,6 +1,7 @@
 import asyncio
 import sys
 from collections.abc import AsyncIterator, Callable, Iterator
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
@@ -10,13 +11,20 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_db, get_github_client
+from app.api.deps import get_db, get_github_client, get_github_oauth_client
 from app.config import get_settings
+from app.core.security import hash_token
 from app.db.base import Base
 from app.db.session import engine
 from app.github.client import GitHubClient
+from app.github.oauth_client import GitHubOAuthClient
 from app.main import app
 from app.models import repository as repository_model  # noqa: F401  (registers table)
+from app.models import session as session_model  # noqa: F401  (registers table)
+from app.models import user as user_model  # noqa: F401  (registers table)
+from app.models.session import Session
+from app.models.user import User
+from app.services.auth import SESSION_COOKIE_NAME
 
 if sys.platform == "win32":
     # pytest-asyncio runs the async test suite in-process (unlike `uvicorn --reload`,
@@ -88,3 +96,46 @@ def stub_github_client() -> Iterator[Callable[[Callable[[httpx.Request], httpx.R
 
     yield _use
     app.dependency_overrides.pop(get_github_client, None)
+
+
+@pytest.fixture
+def stub_github_oauth_client() -> Iterator[
+    Callable[[Callable[[httpx.Request], httpx.Response]], None]
+]:
+    """Lets a test override the GitHub OAuth client with an httpx.MockTransport handler."""
+
+    def _use(handler: Callable[[httpx.Request], httpx.Response]) -> None:
+        mock_http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        app.dependency_overrides[get_github_oauth_client] = lambda: GitHubOAuthClient(
+            mock_http_client,
+            client_id="test-client-id",
+            client_secret="test-client-secret",
+            callback_url="http://127.0.0.1:8000/auth/github/callback",
+        )
+
+    yield _use
+    app.dependency_overrides.pop(get_github_oauth_client, None)
+
+
+@pytest_asyncio.fixture
+async def authenticated_client(
+    async_client: AsyncClient, db_session: AsyncSession
+) -> tuple[AsyncClient, User]:
+    """Inserts a real User + Session row and attaches the session cookie."""
+    user = User(github_id=900001, github_login="octocat")
+    db_session.add(user)
+    await db_session.flush()
+
+    raw_token = "test-session-token"
+    db_session.add(
+        Session(
+            token_hash=hash_token(raw_token),
+            user_id=user.id,
+            expires_at=datetime.now(UTC) + timedelta(days=1),
+        )
+    )
+    await db_session.commit()
+    await db_session.refresh(user)
+
+    async_client.cookies.set(SESSION_COOKIE_NAME, raw_token)
+    return async_client, user

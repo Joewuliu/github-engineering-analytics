@@ -55,7 +55,7 @@ When completing a milestone:
 
 ## Current Milestone
 
-Milestones 1–3 are complete:
+Milestones 1–4 are complete:
 
 - Milestone 1: FastAPI backend foundation.
 - Milestone 2: PostgreSQL via Docker Compose, async SQLAlchemy 2.x, Alembic
@@ -67,8 +67,24 @@ Milestones 1–3 are complete:
   numeric id) return 409. GitHub failures are mapped to safe, explicit HTTP
   statuses (404/502/503/504) with no tokens, stack traces, or raw upstream
   bodies exposed. `httpx` is a runtime dependency.
+- Milestone 4: GitHub OAuth authentication ("Sign in with GitHub"). Full
+  authorization-code flow (`GET /auth/github/login` -> GitHub ->
+  `GET /auth/github/callback`) via a separate `GitHubOAuthClient`. Sessions
+  are server-side, opaque, random tokens; only their SHA-256 hash is ever
+  persisted (`app/core/security.py`) — the raw token lives only in an
+  `HttpOnly` cookie and is never stored, logged, or returned. No
+  `SESSION_SECRET` — nothing is signed. OAuth `state` is mandatory,
+  cookie-carried, and compared with `secrets.compare_digest`. `User` is
+  minimal (`github_id` authoritative, `github_login`) with no profile fields;
+  `Repository` remains global — no per-user ownership yet, no
+  `user_repositories` table. `POST /repositories` now requires
+  authentication (`get_current_user`); `GET /repositories` and `GET /health`
+  remain public. The GitHub OAuth access token is used once (to identify the
+  user) and discarded — never persisted, and untouched by the existing
+  repository-import path.
 
-Do not implement GitHub OAuth, GitHub GraphQL, GitHub webhooks, commits,
-pull requests, reviews, issues, contributors, organizations, analytics,
-Redis, caching, background workers, retry infrastructure, CI/CD, or
-deployment infrastructure until their respective milestones.
+Do not implement additional OAuth providers, password authentication, GitHub
+GraphQL, GitHub webhooks, commits, pull requests, reviews, issues,
+contributors, organizations, analytics, Redis, caching, background workers,
+retry infrastructure, CI/CD, deployment infrastructure, role-based
+authorization, or an admin system until their respective milestones.

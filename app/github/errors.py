@@ -28,3 +28,7 @@ class GitHubTimeoutError(GitHubError):
 
 class GitHubResponseError(GitHubError):
     """GitHub returned a response we could not understand."""
+
+
+class GitHubOAuthError(GitHubError):
+    """GitHub rejected the OAuth token exchange."""

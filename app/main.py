@@ -6,7 +6,7 @@ import httpx
 from fastapi import FastAPI
 
 from app.api.errors import register_exception_handlers
-from app.api.routes import health, repositories
+from app.api.routes import auth, health, repositories
 from app.config import get_settings
 from app.core.logging import configure_logging
 from app.db.session import engine
@@ -38,3 +38,4 @@ app = FastAPI(title=settings.app_name, lifespan=lifespan)
 register_exception_handlers(app)
 app.include_router(health.router)
 app.include_router(repositories.router)
+app.include_router(auth.router)
