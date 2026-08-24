@@ -55,7 +55,11 @@ When completing a milestone:
 
 ## Current Milestone
 
-Establish the initial FastAPI backend foundation.
+Milestone 1 (FastAPI backend foundation) and Milestone 2 (persistence /
+database foundation) are complete: PostgreSQL via Docker Compose, async
+SQLAlchemy 2.x, Alembic migrations, a single `Repository` model, and a
+`GET /repositories` endpoint reading from the database end-to-end.
 
-Do not implement PostgreSQL, GitHub OAuth, Redis, background workers, or
-deployment infrastructure until their respective milestones.
+Do not implement GitHub OAuth, GitHub API integration, Redis, background
+workers, analytics, CI/CD, or deployment infrastructure until their
+respective milestones.

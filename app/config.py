@@ -9,6 +9,8 @@ class Settings(BaseSettings):
     app_name: str = "GitHub Engineering Analytics"
     app_env: str = "development"
     log_level: str = "INFO"
+    database_url: str = "postgresql+psycopg://postgres:postgres@localhost:5432/github_analytics"
+    db_echo: bool = False
 
 
 @lru_cache

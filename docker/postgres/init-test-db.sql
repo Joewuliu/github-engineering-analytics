@@ -1,0 +1,1 @@
+CREATE DATABASE github_analytics_test;
