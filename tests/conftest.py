@@ -1,7 +1,8 @@
 import asyncio
 import sys
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 
+import httpx
 import pytest
 import pytest_asyncio
 from fastapi.testclient import TestClient
@@ -9,10 +10,11 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_db
+from app.api.deps import get_db, get_github_client
 from app.config import get_settings
 from app.db.base import Base
 from app.db.session import engine
+from app.github.client import GitHubClient
 from app.main import app
 from app.models import repository as repository_model  # noqa: F401  (registers table)
 
@@ -72,3 +74,17 @@ async def async_client(db_session: AsyncSession) -> AsyncIterator[AsyncClient]:
     async with AsyncClient(transport=transport, base_url="http://testserver") as async_test_client:
         yield async_test_client
     app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def stub_github_client() -> Iterator[Callable[[Callable[[httpx.Request], httpx.Response]], None]]:
+    """Lets a test override the GitHub client with an httpx.MockTransport handler."""
+
+    def _use(handler: Callable[[httpx.Request], httpx.Response]) -> None:
+        mock_http_client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="https://api.github.com"
+        )
+        app.dependency_overrides[get_github_client] = lambda: GitHubClient(mock_http_client)
+
+    yield _use
+    app.dependency_overrides.pop(get_github_client, None)

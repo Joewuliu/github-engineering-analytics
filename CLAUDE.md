@@ -55,11 +55,20 @@ When completing a milestone:
 
 ## Current Milestone
 
-Milestone 1 (FastAPI backend foundation) and Milestone 2 (persistence /
-database foundation) are complete: PostgreSQL via Docker Compose, async
-SQLAlchemy 2.x, Alembic migrations, a single `Repository` model, and a
-`GET /repositories` endpoint reading from the database end-to-end.
+Milestones 1–3 are complete:
 
-Do not implement GitHub OAuth, GitHub API integration, Redis, background
-workers, analytics, CI/CD, or deployment infrastructure until their
-respective milestones.
+- Milestone 1: FastAPI backend foundation.
+- Milestone 2: PostgreSQL via Docker Compose, async SQLAlchemy 2.x, Alembic
+  migrations, a `Repository` model, `GET /repositories`.
+- Milestone 3: GitHub REST API integration. `POST /repositories` validates
+  input, looks the repository up on the real GitHub REST API via a
+  lifespan-owned shared `httpx.AsyncClient`, treats GitHub's response as
+  authoritative, persists it, and returns 201; duplicate imports (by GitHub's
+  numeric id) return 409. GitHub failures are mapped to safe, explicit HTTP
+  statuses (404/502/503/504) with no tokens, stack traces, or raw upstream
+  bodies exposed. `httpx` is a runtime dependency.
+
+Do not implement GitHub OAuth, GitHub GraphQL, GitHub webhooks, commits,
+pull requests, reviews, issues, contributors, organizations, analytics,
+Redis, caching, background workers, retry infrastructure, CI/CD, or
+deployment infrastructure until their respective milestones.
