@@ -6,6 +6,8 @@ from alembic import context
 from app.config import get_settings
 from app.db.base import Base
 from app.models import (
+    pull_request,  # noqa: F401  (registers models on Base.metadata)
+    pull_request_review,  # noqa: F401  (registers models on Base.metadata)
     repository,  # noqa: F401  (registers models on Base.metadata)
     session,  # noqa: F401  (registers models on Base.metadata)
     user,  # noqa: F401  (registers models on Base.metadata)

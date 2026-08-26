@@ -55,7 +55,7 @@ When completing a milestone:
 
 ## Current Milestone
 
-Milestones 1–5 are complete:
+Milestones 1–6 are complete:
 
 - Milestone 1: FastAPI backend foundation.
 - Milestone 2: PostgreSQL via Docker Compose, async SQLAlchemy 2.x, Alembic
@@ -89,9 +89,26 @@ Milestones 1–5 are complete:
   `app/services/repositories.py`, split into `resolve_repository()`
   (canonical repository find-or-create, including race recovery) and
   `track_repository_for_user()`/`untrack_repository_for_user()`.
+- Milestone 6: pull request and review ingestion. `PullRequest`
+  (`UNIQUE(github_id)`, `UNIQUE(repository_id, number)`) and
+  `PullRequestReview` (`UNIQUE(github_id)`, FK `ON DELETE CASCADE` to its PR)
+  store GitHub event timestamps distinct from our own row timestamps;
+  `author_login`/`reviewer_login` are nullable, mutable strings, never
+  identity. `POST /me/repositories/{repository_id}/sync` (authenticated,
+  same 404 for nonexistent-or-untracked as elsewhere) fetches the most
+  recent `MAX_PULL_REQUESTS_PER_SYNC` = 25 pull requests (`state=all`,
+  newest first — a deliberately small, named, easy-to-replace bound; see
+  `app/services/repository_sync.py`) and every fetched PR's reviews via a
+  small GitHub-specific `Link`-header pagination helper on `GitHubClient`,
+  holds everything in memory, then persists all-or-nothing using
+  PostgreSQL's native `INSERT ... ON CONFLICT DO UPDATE`
+  (`sqlalchemy.dialects.postgresql.insert`) — a deliberate, local exception
+  to the select-then-branch pattern used elsewhere, chosen for this
+  ingestion workload's idempotency/round-trip needs. No analytics yet —
+  schema only preserves what cycle-time and time-to-first-review will need.
 
 Do not implement additional OAuth providers, password authentication, GitHub
-GraphQL, GitHub webhooks, commits, pull requests, reviews, issues,
-contributors, organizations, analytics, Redis, caching, background workers,
-retry infrastructure, CI/CD, deployment infrastructure, role-based
-authorization, or an admin system until their respective milestones.
+GraphQL, GitHub webhooks, commit ingestion, issue ingestion, contributors,
+organizations, analytics, Redis, caching, background workers, retry
+infrastructure, CI/CD, deployment infrastructure, role-based authorization,
+or an admin system until their respective milestones.

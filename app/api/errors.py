@@ -24,6 +24,7 @@ from app.services.auth import (
     UnauthenticatedError,
 )
 from app.services.repositories import RepositoryAlreadyTrackedError
+from app.services.repository_sync import RepositoryNotTrackedError
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,7 @@ _ERROR_MAPPING: dict[type[Exception], tuple[int, str]] = {
     GitHubResponseError: (502, "GitHub returned an unexpected response."),
     GitHubOAuthError: (502, "GitHub OAuth token exchange failed."),
     RepositoryAlreadyTrackedError: (409, "You already track this repository."),
+    RepositoryNotTrackedError: (404, "Repository not found."),
     GitHubOAuthNotConfiguredError: (500, "GitHub OAuth is not configured."),
     UnauthenticatedError: (401, "Not authenticated."),
 }

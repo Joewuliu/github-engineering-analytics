@@ -14,10 +14,12 @@ from app.schemas.repository import (
     RepositoryResponse,
     TrackedRepositoryResponse,
 )
+from app.schemas.sync import RepositorySyncResponse
 from app.services.repositories import (
     track_repository_for_user,
     untrack_repository_for_user,
 )
+from app.services.repository_sync import sync_repository
 
 router = APIRouter()
 
@@ -75,3 +77,21 @@ async def untrack_repository(
     current_user: Annotated[User, Depends(get_current_user)],
 ) -> None:
     await untrack_repository_for_user(repository_id, user=current_user, db=db)
+
+
+@router.post("/me/repositories/{repository_id}/sync", response_model=RepositorySyncResponse)
+async def sync_tracked_repository(
+    repository_id: int,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    github_client: Annotated[GitHubClient, Depends(get_github_client)],
+    current_user: Annotated[User, Depends(get_current_user)],
+) -> RepositorySyncResponse:
+    repository, pr_count, review_count = await sync_repository(
+        repository_id, user=current_user, db=db, github_client=github_client
+    )
+    return RepositorySyncResponse(
+        repository_id=repository.id,
+        full_name=repository.full_name,
+        pull_requests_processed=pr_count,
+        reviews_processed=review_count,
+    )

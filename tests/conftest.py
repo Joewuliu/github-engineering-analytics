@@ -19,6 +19,8 @@ from app.db.session import engine
 from app.github.client import GitHubClient
 from app.github.oauth_client import GitHubOAuthClient
 from app.main import app
+from app.models import pull_request as pull_request_model  # noqa: F401  (registers table)
+from app.models import pull_request_review as pull_request_review_model  # noqa: F401
 from app.models import repository as repository_model  # noqa: F401  (registers table)
 from app.models import session as session_model  # noqa: F401  (registers table)
 from app.models import user as user_model  # noqa: F401  (registers table)

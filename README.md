@@ -4,19 +4,18 @@ A backend application that connects to GitHub, ingests repository activity,
 and calculates engineering analytics. This project is intended to demonstrate
 production-quality backend engineering practices.
 
-## Current Status: Milestone 5 — Per-User Repository Tracking
+## Current Status: Milestone 6 — Pull Request and Review Ingestion
 
 Milestone 1 established the base FastAPI application. Milestone 2 added
 PostgreSQL, async SQLAlchemy 2.x, and Alembic migrations. Milestone 3 added
 GitHub REST API integration. Milestone 4 added "Sign in with GitHub" (OAuth
-with PKCE, server-side sessions). Milestone 5 introduces the many-to-many
-relationship between users and repositories: `Repository` stays a single,
-globally-deduplicated catalog (by GitHub id), while a `user_repositories`
-table records *who* tracks *which* repository. Authenticated users track and
-untrack repositories under `/me/repositories`; `GET /repositories` remains
-the public, global catalog, unaffected by who tracks what. GitHub GraphQL,
-webhooks, Redis, background workers, and analytics still do not exist — those
-arrive in later milestones.
+with PKCE, server-side sessions). Milestone 5 introduced per-user repository
+tracking. Milestone 6 ingests pull requests and their reviews for a tracked
+repository via `POST /me/repositories/{repository_id}/sync`, normalizing and
+persisting them for future analytics (PR cycle time, time to first review —
+not computed yet, deferred to Milestone 7). GitHub GraphQL, webhooks, Redis,
+background workers, and analytics still do not exist — those arrive in later
+milestones.
 
 ## Requirements
 
@@ -118,6 +117,7 @@ after everyone stops tracking it (no garbage collection).
 | `POST /me/repositories` | Yes | Track a repository for the current user (see below) |
 | `GET /me/repositories` | Yes | List repositories the current user tracks, most recently tracked first |
 | `DELETE /me/repositories/{repository_id}` | Yes | Stop tracking a repository (idempotent) |
+| `POST /me/repositories/{repository_id}/sync` | Yes | Ingest PRs/reviews for a tracked repository (see below) |
 
 ### Tracking a repository
 
@@ -169,6 +169,55 @@ canonical `Repository` is never touched.
 ```bash
 curl http://127.0.0.1:8000/repositories
 ```
+
+## Syncing pull requests and reviews
+
+```bash
+curl -X POST http://127.0.0.1:8000/me/repositories/<repository_id>/sync --cookie "session=..."
+```
+
+Fetches this repository's pull requests from GitHub (`state=all`, newest
+first) and every fetched PR's reviews, then persists them. Requires
+authentication and that you track `repository_id`; both a nonexistent
+repository and one you don't track return the same 404, so the endpoint never
+reveals whether an untracked repository exists globally.
+
+**Bounded to the most recent `MAX_PULL_REQUESTS_PER_SYNC` = 25 pull requests**
+(`app/services/repository_sync.py`) — deliberately small and easy to find/
+replace later. Each PR needs its own separate GitHub "list reviews" request,
+so a larger limit multiplies outbound API calls quickly; 25 keeps a sync
+usable even without `GITHUB_TOKEN` configured (GitHub's unauthenticated limit
+is 60 requests/hour). Real full-history or incremental sync is deferred to
+whenever background workers are introduced — this milestone is a bounded,
+synchronous demonstration.
+
+All GitHub fetching (the PR list and every PR's reviews) completes and is
+held in memory *before* any database write begins; persistence then happens
+as a single all-or-nothing transaction — a failure at any point during
+GitHub fetching leaves no partial writes, and a database failure during
+persistence rolls back the entire sync.
+
+Response:
+```json
+{
+  "repository_id": 1,
+  "full_name": "octocat/hello-world",
+  "pull_requests_processed": 25,
+  "reviews_processed": 61
+}
+```
+"Processed" means examined/upserted, not newly inserted — running the same
+sync twice against unchanged GitHub data produces the same counts but zero
+new rows (verified by inspecting table row counts, not by the response
+alone). Re-syncing updates a PR's mutable fields (`state`, `title`,
+`author_login`, `closed_at`, `merged_at`, `github_updated_at`) and a review's
+(`state`, `reviewer_login`, `submitted_at`) in place; identity fields
+(`github_id`, `repository_id`, `number`, `pull_request_id`,
+`github_created_at`) never change. Upserts use PostgreSQL's native
+`INSERT ... ON CONFLICT DO UPDATE` (via `sqlalchemy.dialects.postgresql.insert`),
+not a select-then-branch pattern — this is a deliberate, local exception to
+the pattern used elsewhere in the codebase, chosen for this ingestion
+workload's idempotency and round-trip-count needs.
 
 ## Authentication (Sign in with GitHub)
 
@@ -286,6 +335,19 @@ OAuth login (needs a real browser — GitHub's consent page is interactive):
    http://127.0.0.1:8000/auth/logout --cookie "session=<value>"` -> confirm
    the session row is gone and `/auth/me` now returns 401.
 
+Sync (pick a **small, quiet** repository first, not `fastapi/fastapi` —
+even bounded to 25 PRs, a very active repo's most recent PRs likely have
+many reviews each, making a first smoke test slower than necessary):
+```bash
+curl -X POST http://127.0.0.1:8000/me/repositories/<id>/sync --cookie "session=..."
+docker compose exec db psql -U postgres -d github_analytics -c "select count(*) from pull_requests where repository_id = <id>;"
+docker compose exec db psql -U postgres -d github_analytics -c "select count(*) from pull_request_reviews;"
+```
+Record both counts, then run the identical sync again and re-run both
+`count(*)` queries — they must be unchanged (the response's *processed*
+counts may look similar both times too, but that's not the proof; the
+unchanged row counts are).
+
 ## Linting, formatting, and type checking
 
 ```bash
@@ -305,7 +367,7 @@ app/
 │   ├── errors.py                 # Centralized domain-exception -> HTTP status mapping
 │   └── routes/                   # API route modules
 │       ├── health.py             # GET /health
-│       ├── repositories.py       # GET /repositories, POST/GET/DELETE /me/repositories
+│       ├── repositories.py       # GET /repositories, POST/GET/DELETE /me/repositories, /sync
 │       └── auth.py               # GET /auth/github/login, /callback, /me, POST /auth/logout
 ├── core/
 │   ├── logging.py               # Logging configuration
@@ -314,21 +376,25 @@ app/
 │   ├── base.py                   # Declarative base + naming convention
 │   └── session.py                # Async engine and session factory
 ├── github/
-│   ├── client.py                # GitHubClient — repository REST lookups
+│   ├── client.py                # GitHubClient — repository/PR/review REST lookups + pagination
 │   ├── oauth_client.py           # GitHubOAuthClient — authorize URL, token exchange, user lookup
-│   ├── schemas.py                # GitHubRepository, GitHubAuthenticatedUser
+│   ├── schemas.py                # GitHubRepository, GitHubPullRequest, GitHubReview, ...
 │   └── errors.py                 # GitHubError hierarchy (incl. GitHubOAuthError)
 ├── models/
 │   ├── repository.py           # Repository ORM model (global catalog)
 │   ├── user.py                  # User ORM model (github_id authoritative)
 │   ├── session.py               # Session ORM model (token_hash only, FK -> users, CASCADE)
-│   └── user_repository.py      # UserRepository — composite PK (user_id, repository_id)
+│   ├── user_repository.py      # UserRepository — composite PK (user_id, repository_id)
+│   ├── pull_request.py         # PullRequest — UNIQUE(github_id), UNIQUE(repository_id, number)
+│   └── pull_request_review.py  # PullRequestReview — UNIQUE(github_id)
 ├── services/
 │   ├── repositories.py         # resolve_repository(), track/untrack_repository_for_user()
+│   ├── repository_sync.py      # sync_repository() — bounded PR/review ingestion, Postgres upserts
 │   └── auth.py                  # OAuth state, login completion, session validation/deletion
 └── schemas/
     ├── health.py                # Pydantic response models
     ├── repository.py             # RepositoryResponse, RepositoryCreateRequest, TrackedRepositoryResponse
+    ├── sync.py                   # RepositorySyncResponse
     └── user.py                   # UserResponse
 
 alembic/                    # Migration environment and versions
