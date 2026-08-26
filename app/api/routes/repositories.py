@@ -9,6 +9,7 @@ from app.github.client import GitHubClient
 from app.models.repository import Repository
 from app.models.user import User
 from app.models.user_repository import UserRepository
+from app.schemas.metrics import RepositoryMetricsResponse
 from app.schemas.repository import (
     RepositoryCreateRequest,
     RepositoryResponse,
@@ -19,6 +20,7 @@ from app.services.repositories import (
     track_repository_for_user,
     untrack_repository_for_user,
 )
+from app.services.repository_metrics import get_repository_metrics
 from app.services.repository_sync import sync_repository
 
 router = APIRouter()
@@ -95,3 +97,25 @@ async def sync_tracked_repository(
         pull_requests_processed=pr_count,
         reviews_processed=review_count,
     )
+
+
+@router.get("/me/repositories/{repository_id}/metrics", response_model=RepositoryMetricsResponse)
+async def get_tracked_repository_metrics(
+    repository_id: int,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[User, Depends(get_current_user)],
+) -> RepositoryMetricsResponse:
+    result = await get_repository_metrics(repository_id, user=current_user, db=db)
+    return RepositoryMetricsResponse(
+        repository_id=result.repository.id,
+        full_name=result.repository.full_name,
+        total_pull_requests=result.total_pull_requests,
+        merged_pull_requests=result.merged_pull_requests,
+        merge_rate=_round2(result.merge_rate),
+        median_pr_cycle_time_hours=_round2(result.median_pr_cycle_time_hours),
+        median_time_to_first_review_hours=_round2(result.median_time_to_first_review_hours),
+    )
+
+
+def _round2(value: float | None) -> float | None:
+    return round(value, 2) if value is not None else None

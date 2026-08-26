@@ -1,4 +1,4 @@
-from sqlalchemy import func, select
+from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -8,7 +8,7 @@ from app.models.pull_request import PullRequest
 from app.models.pull_request_review import PullRequestReview
 from app.models.repository import Repository
 from app.models.user import User
-from app.models.user_repository import UserRepository
+from app.services.repositories import get_tracked_repository
 
 # Milestone 6 deliberately bounds sync to a small, fixed window: each pull
 # request requires its own separate GitHub "list reviews" request, so a
@@ -16,10 +16,6 @@ from app.models.user_repository import UserRepository
 # exhausting the unauthenticated rate limit (60/hour) on a single sync call.
 # Replace this with real incremental/background sync in a later milestone.
 MAX_PULL_REQUESTS_PER_SYNC = 25
-
-
-class RepositoryNotTrackedError(Exception):
-    """Raised when repository_id doesn't exist, or exists but isn't tracked by user."""
 
 
 async def sync_repository(
@@ -31,7 +27,7 @@ async def sync_repository(
     list and every PR's reviews are fetched and held in memory first, then
     persistence happens as a single all-or-nothing transaction.
     """
-    repository = await _load_tracked_repository(repository_id, user, db)
+    repository = await get_tracked_repository(repository_id, user, db)
 
     github_prs = await github_client.list_pull_requests(
         repository.full_name, limit=MAX_PULL_REQUESTS_PER_SYNC
@@ -50,23 +46,6 @@ async def sync_repository(
 
     reviews_processed = sum(len(reviews) for reviews in reviews_by_pr.values())
     return repository, len(github_prs), reviews_processed
-
-
-async def _load_tracked_repository(repository_id: int, user: User, db: AsyncSession) -> Repository:
-    repository = await db.get(Repository, repository_id)
-    if repository is None:
-        raise RepositoryNotTrackedError
-
-    tracking = await db.scalar(
-        select(UserRepository).where(
-            UserRepository.user_id == user.id,
-            UserRepository.repository_id == repository_id,
-        )
-    )
-    if tracking is None:
-        raise RepositoryNotTrackedError
-
-    return repository
 
 
 async def _upsert_pull_request(

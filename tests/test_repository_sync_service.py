@@ -13,7 +13,8 @@ from app.models.pull_request_review import PullRequestReview
 from app.models.repository import Repository
 from app.models.user import User
 from app.models.user_repository import UserRepository
-from app.services.repository_sync import RepositoryNotTrackedError, sync_repository
+from app.services.repositories import RepositoryNotTrackedError
+from app.services.repository_sync import sync_repository
 
 
 def _pr(id_: int, number: int, **overrides: object) -> dict[str, object]:

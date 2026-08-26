@@ -12,6 +12,10 @@ class RepositoryAlreadyTrackedError(Exception):
     """Raised when the current user already tracks the requested repository."""
 
 
+class RepositoryNotTrackedError(Exception):
+    """Raised when repository_id doesn't exist, or exists but isn't tracked by user."""
+
+
 async def resolve_repository(
     full_name: str, db: AsyncSession, github_client: GitHubClient
 ) -> Repository:
@@ -84,3 +88,27 @@ async def untrack_repository_for_user(repository_id: int, user: User, db: AsyncS
     if existing is not None:
         await db.delete(existing)
         await db.commit()
+
+
+async def get_tracked_repository(repository_id: int, user: User, db: AsyncSession) -> Repository:
+    """Return repository_id's canonical Repository, if the current user tracks it.
+
+    Raises RepositoryNotTrackedError uniformly for both a nonexistent
+    repository and one that exists globally but isn't tracked by this user --
+    shared by every endpoint that scopes an operation to "repositories I
+    track" (sync, metrics, ...), so they all get identical 404 semantics.
+    """
+    repository = await db.get(Repository, repository_id)
+    if repository is None:
+        raise RepositoryNotTrackedError
+
+    tracking = await db.scalar(
+        select(UserRepository).where(
+            UserRepository.user_id == user.id,
+            UserRepository.repository_id == repository_id,
+        )
+    )
+    if tracking is None:
+        raise RepositoryNotTrackedError
+
+    return repository

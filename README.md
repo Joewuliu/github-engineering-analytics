@@ -4,18 +4,19 @@ A backend application that connects to GitHub, ingests repository activity,
 and calculates engineering analytics. This project is intended to demonstrate
 production-quality backend engineering practices.
 
-## Current Status: Milestone 6 — Pull Request and Review Ingestion
+## Current Status: Milestone 7 — Repository Engineering Analytics
 
 Milestone 1 established the base FastAPI application. Milestone 2 added
 PostgreSQL, async SQLAlchemy 2.x, and Alembic migrations. Milestone 3 added
 GitHub REST API integration. Milestone 4 added "Sign in with GitHub" (OAuth
 with PKCE, server-side sessions). Milestone 5 introduced per-user repository
-tracking. Milestone 6 ingests pull requests and their reviews for a tracked
-repository via `POST /me/repositories/{repository_id}/sync`, normalizing and
-persisting them for future analytics (PR cycle time, time to first review —
-not computed yet, deferred to Milestone 7). GitHub GraphQL, webhooks, Redis,
-background workers, and analytics still do not exist — those arrive in later
-milestones.
+tracking. Milestone 6 ingested pull requests and reviews via
+`POST /me/repositories/{repository_id}/sync`. Milestone 7 turns that stored
+data into the first engineering metrics via
+`GET /me/repositories/{repository_id}/metrics` — computed entirely from
+PostgreSQL, no GitHub calls. GitHub GraphQL, webhooks, Redis, background
+workers, and further analytics (trends, contributor/team breakdowns) still do
+not exist — those arrive in later milestones.
 
 ## Requirements
 
@@ -118,6 +119,7 @@ after everyone stops tracking it (no garbage collection).
 | `GET /me/repositories` | Yes | List repositories the current user tracks, most recently tracked first |
 | `DELETE /me/repositories/{repository_id}` | Yes | Stop tracking a repository (idempotent) |
 | `POST /me/repositories/{repository_id}/sync` | Yes | Ingest PRs/reviews for a tracked repository (see below) |
+| `GET /me/repositories/{repository_id}/metrics` | Yes | Compute engineering metrics from stored data (see below) |
 
 ### Tracking a repository
 
@@ -218,6 +220,68 @@ alone). Re-syncing updates a PR's mutable fields (`state`, `title`,
 not a select-then-branch pattern — this is a deliberate, local exception to
 the pattern used elsewhere in the codebase, chosen for this ingestion
 workload's idempotency and round-trip-count needs.
+
+## Repository engineering metrics
+
+```bash
+curl http://127.0.0.1:8000/me/repositories/<repository_id>/metrics --cookie "session=..."
+```
+
+Requires authentication and that you track `repository_id` (same 404
+semantics as sync — nonexistent and untracked are indistinguishable). Reads
+**only** from PostgreSQL — this endpoint never calls GitHub, and has no
+`GitHubClient` dependency at all, so a repository that's never been synced
+still returns a valid `200` with all-empty metrics rather than an error.
+
+```json
+{
+  "repository_id": 4,
+  "full_name": "owner/repo",
+  "total_pull_requests": 25,
+  "merged_pull_requests": 18,
+  "merge_rate": 0.72,
+  "median_pr_cycle_time_hours": 19.4,
+  "median_time_to_first_review_hours": 3.7
+}
+```
+
+**Important — this describes locally ingested history, not the repository's
+complete GitHub lifetime history.** `total_pull_requests` is a count of
+`PullRequest` rows already stored, bounded by whatever your syncs have
+captured. Because each sync fetches the *newest* 25 PRs but never deletes
+older captured rows, this number isn't a fixed "≤25" cap either — it reflects
+the union of whatever windows your sync history has covered over time.
+
+Definitions:
+- `total_pull_requests` — `COUNT(*)` of stored `PullRequest` rows for the repository.
+- `merged_pull_requests` — `COUNT(*) WHERE merged_at IS NOT NULL`. Never inferred from `state`.
+- `merge_rate` — `merged_pull_requests / total_pull_requests`. **`null`** when
+  `total_pull_requests == 0` (undefined — no data at all), but a real
+  **`0.0`** when PRs exist and none are merged (a genuine zero, not "unknown").
+- `median_pr_cycle_time_hours` — median of `(merged_at - github_created_at)`
+  in fractional hours, across merged PRs only. `statistics.median`, not mean —
+  cycle times are typically right-skewed by a handful of long-lived outliers,
+  and the median better represents the *typical* PR than the mean would.
+  `null` when there are no merged PRs to compute over. A PR whose `merged_at`
+  somehow precedes its `github_created_at` (malformed/historical data) is
+  excluded from this calculation rather than contributing a negative duration.
+- `median_time_to_first_review_hours` — for each PR, its earliest *qualifying*
+  review's `submitted_at` minus `github_created_at`; then the median of that
+  value across PRs that have at least one qualifying review. A review
+  qualifies if `submitted_at IS NOT NULL` (this alone excludes PENDING
+  reviews, which GitHub never gives a `submitted_at`); APPROVED,
+  CHANGES_REQUESTED, COMMENTED, and DISMISSED all qualify — a dismissed
+  review still represents genuine reviewer engagement at the time it was
+  submitted. A review whose `submitted_at` precedes the PR's
+  `github_created_at` is excluded as malformed. This metric is **independent
+  of merge status** — an open, never-merged PR with a review still
+  contributes. `null` when no PR has a qualifying review.
+
+All duration/rate values are rounded to 2 decimal places at the API response
+boundary; the service computes and the tests assert full precision
+internally. Nothing is cached, persisted, or precomputed — every request
+recalculates from `pull_requests`/`pull_request_reviews` directly, which is
+entirely adequate at this scale (ingestion is capped at 25 PRs per sync).
 
 ## Authentication (Sign in with GitHub)
 
@@ -367,7 +431,7 @@ app/
 │   ├── errors.py                 # Centralized domain-exception -> HTTP status mapping
 │   └── routes/                   # API route modules
 │       ├── health.py             # GET /health
-│       ├── repositories.py       # GET /repositories, POST/GET/DELETE /me/repositories, /sync
+│       ├── repositories.py       # GET /repositories, POST/GET/DELETE /me/repositories, /sync, /metrics
 │       └── auth.py               # GET /auth/github/login, /callback, /me, POST /auth/logout
 ├── core/
 │   ├── logging.py               # Logging configuration
@@ -388,13 +452,15 @@ app/
 │   ├── pull_request.py         # PullRequest — UNIQUE(github_id), UNIQUE(repository_id, number)
 │   └── pull_request_review.py  # PullRequestReview — UNIQUE(github_id)
 ├── services/
-│   ├── repositories.py         # resolve_repository(), track/untrack_repository_for_user()
+│   ├── repositories.py         # resolve_repository(), get_tracked_repository(), track/untrack_repository_for_user()
 │   ├── repository_sync.py      # sync_repository() — bounded PR/review ingestion, Postgres upserts
+│   ├── repository_metrics.py   # get_repository_metrics() — Postgres-only, no GitHub calls
 │   └── auth.py                  # OAuth state, login completion, session validation/deletion
 └── schemas/
     ├── health.py                # Pydantic response models
     ├── repository.py             # RepositoryResponse, RepositoryCreateRequest, TrackedRepositoryResponse
     ├── sync.py                   # RepositorySyncResponse
+    ├── metrics.py                 # RepositoryMetricsResponse
     └── user.py                   # UserResponse
 
 alembic/                    # Migration environment and versions

@@ -55,7 +55,7 @@ When completing a milestone:
 
 ## Current Milestone
 
-Milestones 1–6 are complete:
+Milestones 1–7 are complete:
 
 - Milestone 1: FastAPI backend foundation.
 - Milestone 2: PostgreSQL via Docker Compose, async SQLAlchemy 2.x, Alembic
@@ -106,9 +106,36 @@ Milestones 1–6 are complete:
   to the select-then-branch pattern used elsewhere, chosen for this
   ingestion workload's idempotency/round-trip needs. No analytics yet —
   schema only preserves what cycle-time and time-to-first-review will need.
+- Milestone 7: repository engineering analytics. `GET
+  /me/repositories/{repository_id}/metrics` (authenticated, same tracked/404
+  semantics as sync) computes `total_pull_requests`, `merged_pull_requests`,
+  `merge_rate`, `median_pr_cycle_time_hours`, and
+  `median_time_to_first_review_hours` entirely from already-stored
+  `PullRequest`/`PullRequestReview` rows — it has no `GitHubClient`
+  dependency and makes zero GitHub calls, so an untouched-since-tracking
+  repository still returns `200` with empty/null metrics rather than an
+  error. The tracked-repository authorization check used by both `/sync` and
+  `/metrics` was extracted from `repository_sync.py` into
+  `get_tracked_repository()` in `app/services/repositories.py` (alongside
+  `RepositoryNotTrackedError`, moved there too), so both endpoints share
+  identical 401/404 behavior by construction. `app/services/
+  repository_metrics.py` uses a hybrid SQL/Python split: SQL `COUNT` for
+  totals, a targeted two-column `SELECT` for cycle-time, and one joined
+  `SELECT` (no N+1) for first-review timestamps; Python does the datetime
+  subtraction and `statistics.median` (never mean, never PostgreSQL
+  `percentile_cont`). Medians are computed per-PR, not per-review — a PR
+  with many reviews contributes exactly one first-review duration. Rows with
+  a temporally impossible timestamp (`merged_at`/review `submitted_at`
+  earlier than the PR's `github_created_at`) are excluded from their
+  respective median rather than producing a negative duration. Nothing is
+  rounded, cached, or persisted inside the service — rounding to 2 decimal
+  places happens only at the API response boundary in
+  `app/api/routes/repositories.py`. No schema change was required.
 
 Do not implement additional OAuth providers, password authentication, GitHub
 GraphQL, GitHub webhooks, commit ingestion, issue ingestion, contributors,
-organizations, analytics, Redis, caching, background workers, retry
-infrastructure, CI/CD, deployment infrastructure, role-based authorization,
-or an admin system until their respective milestones.
+organizations, team analytics, time-series/trend metrics, percentile-based
+metrics (p90/p95/etc.), frontend/dashboard, Redis, caching, background
+workers, retry infrastructure, CI/CD, deployment infrastructure,
+role-based authorization, or an admin system until their respective
+milestones.

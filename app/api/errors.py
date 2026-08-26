@@ -23,8 +23,7 @@ from app.services.auth import (
     MissingPkceVerifierError,
     UnauthenticatedError,
 )
-from app.services.repositories import RepositoryAlreadyTrackedError
-from app.services.repository_sync import RepositoryNotTrackedError
+from app.services.repositories import RepositoryAlreadyTrackedError, RepositoryNotTrackedError
 
 logger = logging.getLogger(__name__)
 
