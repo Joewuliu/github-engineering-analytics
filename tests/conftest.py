@@ -22,6 +22,7 @@ from app.main import app
 from app.models import repository as repository_model  # noqa: F401  (registers table)
 from app.models import session as session_model  # noqa: F401  (registers table)
 from app.models import user as user_model  # noqa: F401  (registers table)
+from app.models import user_repository as user_repository_model  # noqa: F401  (registers table)
 from app.models.session import Session
 from app.models.user import User
 from app.services.auth import SESSION_COOKIE_NAME
@@ -66,7 +67,9 @@ async def _create_schema(_verify_test_database: None) -> AsyncIterator[None]:
 async def db_session(_create_schema: None) -> AsyncIterator[AsyncSession]:
     async with engine.connect() as connection:
         await connection.begin()
-        session = AsyncSession(bind=connection, join_transaction_mode="create_savepoint")
+        session = AsyncSession(
+            bind=connection, join_transaction_mode="create_savepoint", expire_on_commit=False
+        )
         async with session:
             yield session
         await connection.rollback()

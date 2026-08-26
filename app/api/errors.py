@@ -23,7 +23,7 @@ from app.services.auth import (
     MissingPkceVerifierError,
     UnauthenticatedError,
 )
-from app.services.repository_import import RepositoryAlreadyExistsError
+from app.services.repositories import RepositoryAlreadyTrackedError
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +38,7 @@ _ERROR_MAPPING: dict[type[Exception], tuple[int, str]] = {
     GitHubTimeoutError: (504, "Timed out waiting for GitHub."),
     GitHubResponseError: (502, "GitHub returned an unexpected response."),
     GitHubOAuthError: (502, "GitHub OAuth token exchange failed."),
-    RepositoryAlreadyExistsError: (409, "This repository is already tracked."),
+    RepositoryAlreadyTrackedError: (409, "You already track this repository."),
     GitHubOAuthNotConfiguredError: (500, "GitHub OAuth is not configured."),
     UnauthenticatedError: (401, "Not authenticated."),
 }

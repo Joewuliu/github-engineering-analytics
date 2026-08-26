@@ -24,3 +24,14 @@ class RepositoryCreateRequest(BaseModel):
         if len(parts) != 2 or not parts[0] or not parts[1]:
             raise ValueError("full_name must be in the form 'owner/repository'")
         return value
+
+
+class TrackedRepositoryResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    github_id: int
+    full_name: str
+    created_at: datetime
+    updated_at: datetime
+    tracked_at: datetime

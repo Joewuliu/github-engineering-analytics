@@ -4,17 +4,19 @@ A backend application that connects to GitHub, ingests repository activity,
 and calculates engineering analytics. This project is intended to demonstrate
 production-quality backend engineering practices.
 
-## Current Status: Milestone 4 — GitHub OAuth Authentication
+## Current Status: Milestone 5 — Per-User Repository Tracking
 
 Milestone 1 established the base FastAPI application. Milestone 2 added
 PostgreSQL, async SQLAlchemy 2.x, and Alembic migrations. Milestone 3 added
-GitHub REST API integration (`POST /repositories` looks a repository up on
-GitHub and persists it). Milestone 4 adds "Sign in with GitHub": a full OAuth
-authorization-code flow, server-side sessions (opaque tokens, hashed before
-storage), and `POST /repositories` now requires authentication.
-`GET /repositories` and `GET /health` remain public. GitHub GraphQL, webhooks,
-Redis, background workers, and analytics still do not exist — those arrive in
-later milestones.
+GitHub REST API integration. Milestone 4 added "Sign in with GitHub" (OAuth
+with PKCE, server-side sessions). Milestone 5 introduces the many-to-many
+relationship between users and repositories: `Repository` stays a single,
+globally-deduplicated catalog (by GitHub id), while a `user_repositories`
+table records *who* tracks *which* repository. Authenticated users track and
+untrack repositories under `/me/repositories`; `GET /repositories` remains
+the public, global catalog, unaffected by who tracks what. GitHub GraphQL,
+webhooks, Redis, background workers, and analytics still do not exist — those
+arrive in later milestones.
 
 ## Requirements
 
@@ -93,36 +95,76 @@ http://127.0.0.1:8000/openapi.json.
 
 ## GitHub API access
 
-`POST /repositories` looks the repository up on the real GitHub REST API
-(`https://api.github.com`) before persisting it. `GITHUB_TOKEN` is optional —
-public repositories work without one. Set it in your local (gitignored) `.env`
-only if you want GitHub's higher authenticated rate limit (5000 requests/hour
-instead of 60); never commit a real token. A shared `httpx.AsyncClient` is
-created once in the FastAPI lifespan and closed on shutdown, so repeated
-requests reuse pooled connections.
+`POST /me/repositories` looks the repository up on the real GitHub REST API
+(`https://api.github.com`) before persisting/tracking it. `GITHUB_TOKEN` is
+optional — public repositories work without one. Set it in your local
+(gitignored) `.env` only if you want GitHub's higher authenticated rate limit
+(5000 requests/hour instead of 60); never commit a real token. A shared
+`httpx.AsyncClient` is created once in the FastAPI lifespan and closed on
+shutdown, so repeated requests reuse pooled connections.
 
-### Tracking a repository (requires authentication)
+### Repositories: global catalog vs. per-user tracking
+
+`Repository` rows are a single, global, deduplicated catalog keyed by
+GitHub's numeric id — every user who tracks `fastapi/fastapi` shares the
+*same* row. A separate `user_repositories` table records which users track
+which repositories; deleting a tracking relationship never deletes the
+canonical `Repository`, and a repository stays in the global catalog even
+after everyone stops tracking it (no garbage collection).
+
+| Endpoint | Auth | Behavior |
+|---|---|---|
+| `GET /repositories` | No | Public, global catalog of every tracked-by-someone repository |
+| `POST /me/repositories` | Yes | Track a repository for the current user (see below) |
+| `GET /me/repositories` | Yes | List repositories the current user tracks, most recently tracked first |
+| `DELETE /me/repositories/{repository_id}` | Yes | Stop tracking a repository (idempotent) |
+
+### Tracking a repository
 
 ```bash
-curl -X POST http://127.0.0.1:8000/repositories \
+curl -X POST http://127.0.0.1:8000/me/repositories \
   -H "Content-Type: application/json" \
   --cookie "session=<your session cookie value>" \
   -d '{"full_name": "fastapi/fastapi"}'
 ```
 
-- **201 Created** — the repository was fetched from GitHub and persisted.
-  The response's `full_name` is GitHub's canonical casing, which may differ
-  from what you submitted.
-- **401 Unauthorized** — no valid session (see Authentication below).
-- **409 Conflict** — a repository with that GitHub id is already tracked
-  (checked by GitHub's numeric id, not the submitted string, so resubmitting
-  with different casing still resolves to the same conflict).
+- **201 Created** — a *new tracking relationship* was created. This happens
+  both when the canonical `Repository` didn't exist yet (it's created) and
+  when it already existed globally because someone else tracks it (it's
+  reused) — either way, from the caller's perspective they now track it,
+  which is the resource being created. The response's `full_name` is
+  GitHub's canonical casing, which may differ from what you submitted.
+- **401 Unauthorized** — no valid session.
+- **409 Conflict** — *you* already track this repository (checked by GitHub's
+  numeric id, not the submitted string, so resubmitting with different
+  casing still resolves to the same conflict). Someone else tracking it is
+  never a conflict.
 - **404** — GitHub has no such repository.
 - **502/503/504** — GitHub (or the network) failed in some way; see
   `app/api/errors.py` for the full mapping. Responses never include GitHub
   tokens, raw upstream bodies, or stack traces.
 
-### Listing tracked repositories (public)
+### Listing your tracked repositories
+
+```bash
+curl http://127.0.0.1:8000/me/repositories --cookie "session=..."
+```
+
+Each entry is the repository plus `tracked_at` (when you started tracking
+it) — the one piece of information the tracking relationship adds beyond the
+plain `Repository` shape.
+
+### Untracking a repository
+
+```bash
+curl -X DELETE http://127.0.0.1:8000/me/repositories/<repository_id> --cookie "session=..."
+```
+
+**204** whether or not you were tracking it — idempotent, same precedent as
+`POST /auth/logout`. Only your tracking relationship is removed; the
+canonical `Repository` is never touched.
+
+### Listing the global catalog (public)
 
 ```bash
 curl http://127.0.0.1:8000/repositories
@@ -216,15 +258,23 @@ alembic upgrade head
 uvicorn app.main:app --reload
 ```
 
-Repository import:
+Tracking:
 ```bash
-curl -X POST http://127.0.0.1:8000/repositories --cookie "session=..." \
+curl -X POST http://127.0.0.1:8000/me/repositories --cookie "session=..." \
   -d '{"full_name": "fastapi/fastapi"}'
+curl -X POST http://127.0.0.1:8000/me/repositories --cookie "session=..." \
+  -d '{"full_name": "psf/requests"}'
+curl http://127.0.0.1:8000/me/repositories --cookie "session=..."
 curl http://127.0.0.1:8000/repositories
+docker compose exec db psql -U postgres -d github_analytics -c "select * from user_repositories;"
 ```
-Verify: a 201 with a real numeric `github_id` and GitHub's canonical
-`full_name`; the repository appears in `GET /repositories`; the row exists in
-Postgres; repeating the same `POST` returns 409 with no duplicate row.
+Verify: both POSTs return 201 with real numeric `github_id`s and GitHub's
+canonical `full_name`s; both appear in `GET /me/repositories` with
+`tracked_at`; both appear in the public `GET /repositories`; `user_repositories`
+has two rows for your user. Repeating one POST returns 409 with no duplicate
+row. `DELETE /me/repositories/<id>` for one returns 204, its
+`user_repositories` row is gone, and the `Repository` row still appears in
+`GET /repositories`; repeating the same `DELETE` returns 204 again.
 
 OAuth login (needs a real browser — GitHub's consent page is interactive):
 1. Visit `http://127.0.0.1:8000/auth/github/login`, approve on GitHub.
@@ -255,7 +305,7 @@ app/
 │   ├── errors.py                 # Centralized domain-exception -> HTTP status mapping
 │   └── routes/                   # API route modules
 │       ├── health.py             # GET /health
-│       ├── repositories.py       # GET /repositories, POST /repositories (auth required)
+│       ├── repositories.py       # GET /repositories, POST/GET/DELETE /me/repositories
 │       └── auth.py               # GET /auth/github/login, /callback, /me, POST /auth/logout
 ├── core/
 │   ├── logging.py               # Logging configuration
@@ -269,15 +319,16 @@ app/
 │   ├── schemas.py                # GitHubRepository, GitHubAuthenticatedUser
 │   └── errors.py                 # GitHubError hierarchy (incl. GitHubOAuthError)
 ├── models/
-│   ├── repository.py           # Repository ORM model
+│   ├── repository.py           # Repository ORM model (global catalog)
 │   ├── user.py                  # User ORM model (github_id authoritative)
-│   └── session.py               # Session ORM model (token_hash only, FK -> users, CASCADE)
+│   ├── session.py               # Session ORM model (token_hash only, FK -> users, CASCADE)
+│   └── user_repository.py      # UserRepository — composite PK (user_id, repository_id)
 ├── services/
-│   ├── repository_import.py   # import_repository() — GitHub fetch + persist + dedupe
+│   ├── repositories.py         # resolve_repository(), track/untrack_repository_for_user()
 │   └── auth.py                  # OAuth state, login completion, session validation/deletion
 └── schemas/
     ├── health.py                # Pydantic response models
-    ├── repository.py             # RepositoryResponse, RepositoryCreateRequest
+    ├── repository.py             # RepositoryResponse, RepositoryCreateRequest, TrackedRepositoryResponse
     └── user.py                   # UserResponse
 
 alembic/                    # Migration environment and versions

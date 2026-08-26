@@ -55,33 +55,40 @@ When completing a milestone:
 
 ## Current Milestone
 
-Milestones 1–4 are complete:
+Milestones 1–5 are complete:
 
 - Milestone 1: FastAPI backend foundation.
 - Milestone 2: PostgreSQL via Docker Compose, async SQLAlchemy 2.x, Alembic
   migrations, a `Repository` model, `GET /repositories`.
-- Milestone 3: GitHub REST API integration. `POST /repositories` validates
-  input, looks the repository up on the real GitHub REST API via a
-  lifespan-owned shared `httpx.AsyncClient`, treats GitHub's response as
-  authoritative, persists it, and returns 201; duplicate imports (by GitHub's
-  numeric id) return 409. GitHub failures are mapped to safe, explicit HTTP
-  statuses (404/502/503/504) with no tokens, stack traces, or raw upstream
-  bodies exposed. `httpx` is a runtime dependency.
-- Milestone 4: GitHub OAuth authentication ("Sign in with GitHub"). Full
-  authorization-code flow (`GET /auth/github/login` -> GitHub ->
-  `GET /auth/github/callback`) via a separate `GitHubOAuthClient`. Sessions
-  are server-side, opaque, random tokens; only their SHA-256 hash is ever
-  persisted (`app/core/security.py`) — the raw token lives only in an
-  `HttpOnly` cookie and is never stored, logged, or returned. No
-  `SESSION_SECRET` — nothing is signed. OAuth `state` is mandatory,
-  cookie-carried, and compared with `secrets.compare_digest`. `User` is
-  minimal (`github_id` authoritative, `github_login`) with no profile fields;
-  `Repository` remains global — no per-user ownership yet, no
-  `user_repositories` table. `POST /repositories` now requires
-  authentication (`get_current_user`); `GET /repositories` and `GET /health`
-  remain public. The GitHub OAuth access token is used once (to identify the
-  user) and discarded — never persisted, and untouched by the existing
-  repository-import path.
+- Milestone 3: GitHub REST API integration. GitHub's response is treated as
+  authoritative for `github_id`/canonical `full_name`. GitHub failures are
+  mapped to safe, explicit HTTP statuses (404/502/503/504) with no tokens,
+  stack traces, or raw upstream bodies exposed. `httpx` is a runtime
+  dependency.
+- Milestone 4: GitHub OAuth authentication ("Sign in with GitHub") with PKCE
+  (RFC 7636, S256). Sessions are server-side, opaque, random tokens; only
+  their SHA-256 hash is ever persisted (`app/core/security.py`) — the raw
+  token lives only in an `HttpOnly` cookie and is never stored, logged, or
+  returned. No `SESSION_SECRET` — nothing is signed. OAuth `state` and the
+  PKCE `code_verifier` are both mandatory, cookie-carried, and validated
+  before any token exchange. `User` is minimal (`github_id` authoritative,
+  `github_login`) with no profile fields. The GitHub OAuth access token is
+  used once (to identify the user) and discarded — never persisted.
+- Milestone 5: per-user repository tracking. `Repository` remains a single,
+  globally-deduplicated catalog (by `github_id`); a `user_repositories`
+  table (composite PK `(user_id, repository_id)`, both FKs `ON DELETE
+  CASCADE`) records which users track which repositories, with `tracked_at`
+  as the only relationship metadata. `POST /me/repositories` replaced
+  `POST /repositories` (no alias kept — no external clients yet); it returns
+  201 whenever a new tracking relationship is created, whether the canonical
+  `Repository` was new or already existed globally, and 409 only when the
+  current user specifically already tracks it. `GET /me/repositories` and
+  `DELETE /me/repositories/{repository_id}` are new, both authenticated;
+  `GET /repositories` and `GET /health` remain public and unchanged.
+  `app/services/repository_import.py` was renamed to
+  `app/services/repositories.py`, split into `resolve_repository()`
+  (canonical repository find-or-create, including race recovery) and
+  `track_repository_for_user()`/`untrack_repository_for_user()`.
 
 Do not implement additional OAuth providers, password authentication, GitHub
 GraphQL, GitHub webhooks, commits, pull requests, reviews, issues,
