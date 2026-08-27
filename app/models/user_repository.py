@@ -22,5 +22,5 @@ class UserRepository(Base):
     )
     tracked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
-    user: Mapped["User"] = relationship(back_populates="tracked_repositories")
-    repository: Mapped["Repository"] = relationship(back_populates="trackers")
+    user: Mapped[User] = relationship(back_populates="tracked_repositories")
+    repository: Mapped[Repository] = relationship(back_populates="trackers")

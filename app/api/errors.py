@@ -23,6 +23,7 @@ from app.services.auth import (
     MissingPkceVerifierError,
     UnauthenticatedError,
 )
+from app.services.readiness import DatabaseNotReadyError
 from app.services.repositories import RepositoryAlreadyTrackedError, RepositoryNotTrackedError
 from app.services.sync_jobs import (
     RepositorySyncAlreadyActiveError,
@@ -50,6 +51,7 @@ _ERROR_MAPPING: dict[type[Exception], tuple[int, str]] = {
     RepositorySyncAlreadyActiveError: (409, "Repository sync already in progress."),
     SyncJobEnqueueError: (503, "Could not schedule the sync job. Try again later."),
     SyncJobNotFoundError: (404, "Sync job not found."),
+    DatabaseNotReadyError: (503, "Service not ready."),
 }
 
 # These are the pre-token-exchange callback validation failures: state

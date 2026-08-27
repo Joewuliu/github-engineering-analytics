@@ -55,7 +55,7 @@ When completing a milestone:
 
 ## Current Milestone
 
-Milestones 1–8 are complete:
+Milestones 1–9 are complete:
 
 - Milestone 1: FastAPI backend foundation.
 - Milestone 2: PostgreSQL via Docker Compose, async SQLAlchemy 2.x, Alembic
@@ -196,6 +196,77 @@ Milestones 1–8 are complete:
   by running the actual worker process end-to-end against live
   Postgres/Redis, not by the (fully offline, Redis-free) automated test
   suite.
+- Milestone 9: reproducible Dockerized application + CI. No new product
+  features — the goal was making the existing backend reproducible,
+  containerized, and automatically tested. One application image (built
+  from a single-stage `Dockerfile`, `python:3.14.7-slim-trixie`, non-root
+  `appuser`, `pip install .` — never `.[dev]`, so pytest/ruff/mypy never
+  enter the image) is used, with different `command:`s, by three new
+  Compose services: `migrate` (`alembic upgrade head`, runs once and
+  exits), `api` (`uvicorn app.main:app --host 0.0.0.0 --port 8000`), and
+  `worker` (unchanged from Milestone 8: `dramatiq app.worker.tasks
+  --processes 1 --threads 1`). `api`/`worker` depend on `migrate` via
+  Compose's `service_completed_successfully` condition and on `redis`
+  being healthy — migrations are never run inside either app process's own
+  startup, avoiding both a startup race and mixing schema-management
+  concerns into normal process startup. Inside Docker, `DATABASE_URL`/
+  `REDIS_URL` are overridden to `db:5432`/`redis:6379` purely via
+  `environment:` in `compose.yaml` — `app/config.py` still defaults to
+  `localhost` (correct for local, non-Docker use), so no Docker hostname
+  is ever hard-coded into application source. Added `GET /ready`
+  (`app/services/readiness.py`), checking PostgreSQL only via `SELECT 1` —
+  deliberately not GitHub (external, must never gate readiness) and not
+  Redis (only needed to create a sync job, not to read repositories/
+  metrics). The `api` container's Docker healthcheck stays pointed at the
+  existing dependency-free `GET /health`, not `/ready` — a transient
+  Postgres blip shouldn't flap the API container's own liveness status;
+  that's what gates *startup order* via `migrate`, not ongoing liveness.
+  Both the existing local workflow (`docker compose up -d db redis` +
+  local `uvicorn`/`dramatiq`/`alembic`) and the new full-Docker workflow
+  (`docker compose up --build`) are preserved side by side, sharing one
+  `compose.yaml`/`.env` — nothing is duplicated between them.
+  `requires-python`, `[tool.mypy] python_version`, and `[tool.ruff]
+  target-version` were bumped from 3.12 to 3.14 to match the interpreter
+  actually used for development, Docker, and CI (bumping
+  `requires-python` narrows the package's declared compatible-version
+  range, not merely a lint-config change); this incidentally made
+  ruff's `UP037` flag five `Mapped["ClassName"]` quoted forward
+  references in `app/models/` as removable, since Python 3.14 defers
+  annotation evaluation by default (PEP 649) — the unquoted form was
+  verified safe (full test suite + mypy strict, both green) before being
+  applied, given quoted forward references to `TYPE_CHECKING`-only
+  imports are exactly the kind of thing that broke a real, different
+  SQLAlchemy name-resolution case during Milestone 8. CI
+  (`.github/workflows/ci.yml`) is one workflow, two jobs: `quality` (a
+  real `postgres:16-alpine` GitHub Actions service container seeded with
+  only `github_analytics_test`, `DATABASE_URL` scoped to it, the existing
+  `_test`-suffix pytest safety guard untouched and active, then `alembic
+  upgrade head` / `alembic check` / a light `downgrade -1` + `upgrade
+  head` reversibility smoke test / `pytest` / `ruff check .` / `ruff
+  format --check .` / `mypy app` — no Redis service, matching the test
+  suite's deliberate Redis-free design) and `docker-smoke` (`needs:
+  quality`; builds the image, brings up the full Compose stack against a
+  CI-only `.env` generated from `.env.example` with placeholder OAuth
+  values — no real secrets, no GitHub calls, no OAuth login — polls
+  `/health` with a bounded retry loop rather than a fixed sleep, then
+  verifies `migrate` exited `0`, `worker` is still running, and the
+  Dramatiq actor imports/registers via a standalone `docker run --rm
+  <image> python -c "from app.worker.tasks import sync_repository_actor"`
+  that needs no live Redis; always tears down with `docker compose down
+  -v`). `quality` and `docker-smoke` are deliberately separate jobs so
+  `docker-smoke`'s own Compose-managed `db` (host port 5432) never runs
+  alongside `quality`'s GitHub Actions Postgres service (also port 5432)
+  in the same job. `.dockerignore` excludes `.env`, `.git`, `tests/`, and
+  all caches; verified directly (not just asserted) that the built image
+  runs as a non-root user, contains no `.env`, and has no dev tooling
+  (pytest/ruff/mypy) installed. No dependency lock file was introduced —
+  the Python/OS layer is now pinned and reproducible
+  (`python:3.14.7-slim-trixie`), but `pip install .` still resolves
+  dependency versions against PyPI at build time, so builds are not
+  byte-for-byte deterministic; documented as a known limitation rather
+  than solved. No lock-file/dependency-manager migration, no reverse
+  proxy/HTTPS, no cloud deployment, and no worker HTTP health check
+  (deliberately) were introduced.
 
 Do not implement ARQ, Celery, or RQ; background retries; scheduling/cron;
 GitHub webhooks; job cancellation; job progress percentages; a job-listing
@@ -203,5 +274,7 @@ endpoint; stale-job recovery/heartbeats; Redis persistence tuning; additional
 OAuth providers; password authentication; GitHub GraphQL; commit ingestion;
 issue ingestion; contributors; organizations; team analytics; time-series/
 trend metrics; percentile-based metrics (p90/p95/etc.); frontend/dashboard;
-CI/CD; deployment infrastructure; app containerization; role-based
-authorization; or an admin system until their respective milestones.
+cloud deployment (AWS/GCP/Azure), Kubernetes, Terraform, Helm, a reverse
+proxy/nginx, HTTPS/domain configuration, a dependency-manager migration, an
+observability platform, role-based authorization; or an admin system until
+their respective milestones.

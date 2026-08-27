@@ -1,0 +1,123 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: github_analytics_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/github_analytics_test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      # The existing pytest safety guard (tests/conftest.py) refuses to run
+      # unless DATABASE_URL's database name ends in "_test" -- unchanged and
+      # active here, protecting against ever accidentally testing against a
+      # dev database, in CI exactly as locally.
+      - name: Apply migrations
+        run: alembic upgrade head
+
+      - name: Verify no model changes are missing a migration
+        run: alembic check
+
+      - name: Migration reversibility smoke test
+        run: |
+          alembic downgrade -1
+          alembic upgrade head
+
+      - name: pytest
+        run: pytest
+
+      - name: ruff check
+        run: ruff check .
+
+      - name: ruff format check
+        run: ruff format --check .
+
+      - name: mypy
+        run: mypy app
+
+  docker-smoke:
+    needs: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # No real .env is committed to the repository. This CI-only .env is
+      # derived from .env.example with obviously-fake OAuth placeholders --
+      # solely to satisfy Settings validation while booting the stack. No
+      # GitHub API call and no OAuth flow happens in this job.
+      - name: Create CI-only .env
+        run: |
+          cp .env.example .env
+          sed -i 's/^GITHUB_OAUTH_CLIENT_ID=.*/GITHUB_OAUTH_CLIENT_ID=ci-placeholder/' .env
+          sed -i 's/^GITHUB_OAUTH_CLIENT_SECRET=.*/GITHUB_OAUTH_CLIENT_SECRET=ci-placeholder/' .env
+
+      # Deliberately no GitHub Actions Postgres service in this job -- Compose
+      # starts its own `db` service on host port 5432, and running both at
+      # once in the same job would conflict on that port. This is the whole
+      # reason quality/docker-smoke are separate jobs (see README CI section).
+      - name: Build and start the full stack
+        run: docker compose up -d --build
+
+      - name: Wait for API health
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8000/health; then
+              echo "API is healthy"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "API did not become healthy in time"
+          docker compose logs
+          exit 1
+
+      - name: Show service state
+        run: docker compose ps
+
+      - name: Verify migrate exited successfully
+        run: |
+          exit_code=$(docker inspect --format='{{.State.ExitCode}}' "$(docker compose ps -a -q migrate)")
+          echo "migrate exit code: $exit_code"
+          test "$exit_code" = "0"
+
+      - name: Verify worker is still running
+        run: |
+          status=$(docker inspect --format='{{.State.Status}}' "$(docker compose ps -q worker)")
+          echo "worker status: $status"
+          test "$status" = "running"
+
+      - name: Verify Dramatiq actor imports and registers correctly
+        run: |
+          docker run --rm github-engineering-analytics:local \
+            python -c "from app.worker.tasks import sync_repository_actor; print(sync_repository_actor.actor_name)"
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

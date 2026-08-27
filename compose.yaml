@@ -28,5 +28,57 @@ services:
       timeout: 5s
       retries: 5
 
+  # One-off: applies migrations, then exits. api/worker wait for this to
+  # succeed rather than each running `alembic upgrade head` themselves --
+  # see README "Migration service" for why.
+  migrate:
+    build: .
+    image: github-engineering-analytics:local
+    command: alembic upgrade head
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@db:5432/github_analytics
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build: .
+    image: github-engineering-analytics:local
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@db:5432/github_analytics
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8000:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  worker:
+    build: .
+    image: github-engineering-analytics:local
+    command: dramatiq app.worker.tasks --processes 1 --threads 1
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@db:5432/github_analytics
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   pgdata:

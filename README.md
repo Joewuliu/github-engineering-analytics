@@ -4,7 +4,7 @@ A backend application that connects to GitHub, ingests repository activity,
 and calculates engineering analytics. This project is intended to demonstrate
 production-quality backend engineering practices.
 
-## Current Status: Milestone 8 — Durable Background Repository Sync Jobs
+## Current Status: Milestone 9 — Reproducible Dockerized Application + CI
 
 Milestone 1 established the base FastAPI application. Milestone 2 added
 PostgreSQL, async SQLAlchemy 2.x, and Alembic migrations. Milestone 3 added
@@ -13,23 +13,42 @@ with PKCE, server-side sessions). Milestone 5 introduced per-user repository
 tracking. Milestone 6 ingested pull requests and reviews. Milestone 7 turned
 that stored data into engineering metrics via
 `GET /me/repositories/{repository_id}/metrics` — computed entirely from
-PostgreSQL, no GitHub calls. Milestone 8 moves repository sync off the
-request/response cycle: `POST /me/repositories/{repository_id}/sync` now
-returns `202 Accepted` immediately and does the actual GitHub fetching in a
-Dramatiq background worker, with `GET /me/sync-jobs/{job_id}` for polling
-status. GitHub GraphQL, webhooks, scheduling, and further analytics (trends,
-contributor/team breakdowns) still do not exist — those arrive in later
+PostgreSQL, no GitHub calls. Milestone 8 moved repository sync off the
+request/response cycle via a Dramatiq background worker and Redis queue.
+Milestone 9 adds no new product features — it makes the existing backend
+reproducible: the whole stack (API, worker, Postgres, Redis) now runs through
+one Docker Compose command, backed by a single application image, a dedicated
+migration step, `/ready` for orchestration-aware readiness, and a GitHub
+Actions CI workflow. GitHub GraphQL, webhooks, scheduling, further analytics,
+and any actual cloud deployment still do not exist — those arrive in later
 milestones.
+
+## Quick start
+
+The fastest way to run the whole application, for someone evaluating this
+repository who doesn't want to set up a Python environment:
+
+```bash
+git clone <this repo> && cd github-engineering-analytics
+cp .env.example .env
+docker compose up --build
+```
+
+Wait for `api` to report healthy (`docker compose ps`), then visit
+http://127.0.0.1:8000/docs. See [Running the application](#running-the-application)
+for what actually happens during that command, and
+[Option B](#option-b-local-development) for the faster-iteration alternative
+used for active development.
 
 ## Requirements
 
-- Python 3.12+
-- Docker and Docker Compose (for PostgreSQL and Redis)
+- Docker and Docker Compose — the only requirement for the [Quick start](#quick-start) above.
+- Python 3.14+ — only needed for [Option B](#option-b-local-development) (running `uvicorn`/`dramatiq`/`pytest` directly) or contributing.
 
 ## Setup
 
 Create and activate a virtual environment, then install the project with dev
-dependencies:
+dependencies (skip this if you're only using the full-Docker workflow):
 
 ```bash
 python -m venv .venv
@@ -45,34 +64,161 @@ Copy `.env.example` to `.env` and adjust values as needed:
 cp .env.example .env
 ```
 
-## Database and queue (PostgreSQL + Redis via Docker Compose)
+## Running the application
 
-`compose.yaml` runs a PostgreSQL container and a Redis container. On first
-start Postgres creates two databases: `github_analytics` (development) and
-`github_analytics_test` (used only by the test suite), via
-`docker/postgres/init-test-db.sql`. Redis (`redis:7-alpine`) is used purely
-as the Dramatiq queue transport for background repository sync (see
-[Syncing pull requests and reviews](#syncing-pull-requests-and-reviews-background))
-— it has no persistence configured and holds no data that needs to survive a
-restart except in-flight queued jobs.
+Two supported workflows, sharing the same `compose.yaml` and the same `.env`
+— nothing is duplicated between them, just a different subset of services.
 
-Start both:
+### Option A: full Docker Compose
 
 ```bash
-docker compose up -d
+docker compose up --build
 ```
 
-Stop them (Postgres data persists in the `pgdata` volume):
+This builds one application image and starts, in dependency order:
+`db` (Postgres) and `redis` become healthy → `migrate` runs `alembic upgrade
+head` and exits → `api` and `worker` start, using that same image with
+different commands. See [Service architecture](#service-architecture) and
+[Migration service](#migration-service) below for exactly how that ordering
+is enforced. The API is available at http://127.0.0.1:8000 (docs at `/docs`),
+identical to Option B from the outside. Best for evaluating the repository or
+proving "this is what would actually run" — the image is immutable, no bind
+mounts, no `--reload`.
+
+### Option B: local development
 
 ```bash
-docker compose stop
+docker compose up -d db redis
 ```
 
-Stop and remove everything, including all Postgres data:
+then, in separate terminals:
 
 ```bash
-docker compose down -v
+uvicorn app.main:app --reload
+dramatiq app.worker.tasks --processes 1 --threads 1
 ```
+
+and, once (or after adding a migration):
+
+```bash
+alembic upgrade head
+```
+
+Best for active development — code changes take effect on save (`--reload`)
+without rebuilding an image. This is unchanged from Milestone 8.
+
+Note for Windows: `uvicorn --reload` works as-is because `--reload` runs the
+server in a subprocess, and uvicorn selects `SelectorEventLoop` for that case
+— which is what psycopg's async driver requires. Running uvicorn *without*
+`--reload` on Windows would hit the default `ProactorEventLoop`, which
+psycopg cannot use — irrelevant inside the Docker image (Option A), since
+Linux's default loop is already compatible; this note only applies to running
+uvicorn directly on Windows.
+
+## Service architecture
+
+```
+db (Postgres) ──┐
+                 ├─▶ migrate (alembic upgrade head, then exits)
+redis ───────────┤        │
+                 │        ▼
+                 └─▶ api ─────▶ worker
+```
+
+`api` and `worker` are the **same application image**
+(`github-engineering-analytics:local`), started with different `command:` —
+`uvicorn app.main:app --host 0.0.0.0 --port 8000` vs.
+`dramatiq app.worker.tasks --processes 1 --threads 1`. `migrate` is a
+one-off use of that same image. Compose's default per-project network is
+used — no custom network is needed since all five services already resolve
+each other by service name. Only `api` publishes a port to the host
+(`8000:8000`); `db` (`5432`) and `redis` (`6379`) also publish theirs, purely
+for host-side convenience (`psql`, `redis-cli`, or Option B's local
+processes) — `worker` publishes nothing.
+
+## Migration service
+
+`migrate` runs `alembic upgrade head` once and exits — it is not run inside
+either `api`'s or `worker`'s own startup command. Both deliberately embedding
+`alembic upgrade head` into two different processes' startup would risk two
+containers racing to apply DDL concurrently and would mix schema-management
+concerns into normal process startup; a dedicated one-off service keeps
+migration ownership explicit and singular. `api`/`worker` declare
+`depends_on: migrate: condition: service_completed_successfully` — Compose
+will not start either until `migrate` has exited with status `0`. To run
+migrations without starting the rest of the stack (e.g. after pulling a new
+migration):
+
+```bash
+docker compose run --rm migrate
+```
+
+### Known limitations (Docker/CI)
+
+- **No dependency lock file**: the image installs from `pyproject.toml`'s
+  version *ranges* against PyPI at build time. The Python/OS layer is now
+  pinned and reproducible (`python:3.14.7-slim-trixie`), but dependency
+  resolution is not byte-for-byte deterministic build-to-build. Introducing
+  a lock file (or switching dependency managers) is out of scope for this
+  milestone.
+- **`worker` has no health check**, deliberately — nothing else `depends_on`
+  it being "healthy" in a deeper sense than "the container is running," and
+  a fake HTTP server purely to give Compose something to poll would be
+  needless complexity. `docker compose ps`/`logs worker` plus its `restart:
+  unless-stopped` policy are what's actually available for observing it.
+- **`docker-smoke`'s timing** depends on the GitHub Actions runner and image
+  pull speed on a given run; its health-poll uses a bounded retry loop
+  rather than a fixed sleep specifically to absorb that variance, but a
+  genuinely overloaded runner could still make it the slowest, most
+  failure-prone step in CI.
+
+## Health and readiness
+
+- `GET /health` — dependency-free liveness. Always fast, never touches
+  Postgres/Redis/GitHub. This is what the `api` container's Docker
+  `healthcheck:` polls — a transient Postgres blip shouldn't make Compose
+  think the API *container itself* needs restarting; that's Postgres's own
+  healthcheck's job to gate *startup order* (via `migrate`), not something
+  that should flap the API's ongoing liveness status.
+- `GET /ready` — checks PostgreSQL only, via a plain `SELECT 1`: `200` if
+  reachable, `503` if not. Deliberately does **not** check GitHub (external,
+  expected to be occasionally unavailable, must never gate our own
+  readiness) or Redis (only needed to create a sync job — not for listing
+  repositories or reading metrics, so it shouldn't make the whole API report
+  unready over one write path).
+
+## Database and queue (PostgreSQL + Redis)
+
+`compose.yaml`'s `db` service creates two databases on first start:
+`github_analytics` (development — the only one `api`/`worker`/`migrate` ever
+use) and `github_analytics_test` (used only by the test suite, via
+`docker/postgres/init-test-db.sql`), kept isolated exactly as before.
+`redis` (`redis:7-alpine`) is used purely as the Dramatiq queue transport
+(see [Syncing pull requests and reviews](#syncing-pull-requests-and-reviews-background))
+— no persistence configured, holding nothing that needs to survive a restart
+except in-flight queued jobs.
+
+```bash
+docker compose up -d db redis     # infrastructure only (Option B)
+docker compose stop               # stop everything -- Postgres data persists in the pgdata volume
+docker compose down                # stop and remove containers -- pgdata volume still persists
+docker compose down -v             # stop and remove EVERYTHING, including the pgdata volume
+```
+
+**`docker compose down -v` permanently deletes your local Postgres data.**
+Use plain `docker compose down` (or `docker compose stop`) to shut down
+without losing tracked repositories, synced PRs/reviews, or sessions — reach
+for `-v` only when you deliberately want a completely clean slate.
+
+### Container-to-container URLs
+
+Inside Docker, `localhost` does not mean "another service" — so `api`,
+`worker`, and `migrate` are given `DATABASE_URL`/`REDIS_URL` pointing at
+`db:5432`/`redis:6379` via `environment:` overrides in `compose.yaml`, which
+take precedence over the same keys loaded from `.env`. No application code
+hard-codes these hostnames — `Settings` (`app/config.py`) still defaults to
+`localhost`, which is what's correct for Option B's local Python processes.
+The only place `db`/`redis` hostnames ever appear is `compose.yaml`.
 
 ### Migrations
 
@@ -83,23 +229,6 @@ Alembic reads the database URL from `Settings` (`app/config.py`), not from
 alembic upgrade head              # apply all migrations
 alembic revision --autogenerate -m "description"   # generate a new migration
 ```
-
-## Running the server
-
-```bash
-uvicorn app.main:app --reload
-```
-
-Note for Windows: this works as-is because `--reload` makes uvicorn run the
-server in a subprocess, and uvicorn selects `SelectorEventLoop` for that case
-— which is what psycopg's async driver requires. Running *without* `--reload`
-(e.g. a future single-process production command) would hit Windows's default
-`ProactorEventLoop`, which psycopg cannot use; if that's ever needed, pass
-`--loop asyncio:SelectorEventLoop` explicitly at that call site.
-
-The API will be available at http://127.0.0.1:8000, with interactive docs at
-http://127.0.0.1:8000/docs and the OpenAPI schema at
-http://127.0.0.1:8000/openapi.json.
 
 ## GitHub API access
 
@@ -338,18 +467,12 @@ POST /sync  ->  authorize + create SyncJob(queued)  ->  enqueue job id (string) 
   connections across jobs. Worth revisiting only if real throughput demands
   it.
 
-### Local development (three processes)
+### Running it
 
-```powershell
-# Terminal 1 — PostgreSQL + Redis
-docker compose up -d
-
-# Terminal 2 — FastAPI
-uvicorn app.main:app --reload
-
-# Terminal 3 — Dramatiq worker (one process, one thread)
-dramatiq app.worker.tasks --processes 1 --threads 1
-```
+See [Running the application](#running-the-application) for both supported
+workflows (full Docker, or local processes against Dockerized Postgres/Redis)
+— both run the exact same `dramatiq app.worker.tasks --processes 1 --threads 1`
+command.
 
 One process/one thread is a deliberate Milestone 8 choice, not an
 architectural limit: PostgreSQL's partial unique index is what actually
@@ -525,9 +648,10 @@ Run this against the **development** database (`github_analytics`), not the
 test database:
 
 ```bash
-docker compose up -d db
+docker compose up -d db redis
 alembic upgrade head
 uvicorn app.main:app --reload
+dramatiq app.worker.tasks --processes 1 --threads 1   # separate terminal, needed for the sync check below
 ```
 
 Tracking:
@@ -563,13 +687,16 @@ even bounded to 25 PRs, a very active repo's most recent PRs likely have
 many reviews each, making a first smoke test slower than necessary):
 ```bash
 curl -X POST http://127.0.0.1:8000/me/repositories/<id>/sync --cookie "session=..."
+# -> 202 {"job_id": "...", "repository_id": <id>, "status": "queued"}
+curl http://127.0.0.1:8000/me/sync-jobs/<job_id> --cookie "session=..."
+# poll until "status": "succeeded" (or "failed") -- see the worker terminal's logs meanwhile
 docker compose exec db psql -U postgres -d github_analytics -c "select count(*) from pull_requests where repository_id = <id>;"
 docker compose exec db psql -U postgres -d github_analytics -c "select count(*) from pull_request_reviews;"
 ```
-Record both counts, then run the identical sync again and re-run both
-`count(*)` queries — they must be unchanged (the response's *processed*
-counts may look similar both times too, but that's not the proof; the
-unchanged row counts are).
+Record both counts, then run the identical sync again (a fresh `POST` once
+the first job is terminal) and re-run both `count(*)` queries — they must be
+unchanged (the completed job's *processed* counts may look similar both
+times too, but that's not the proof; the unchanged row counts are).
 
 ## Linting, formatting, and type checking
 
@@ -577,6 +704,45 @@ unchanged row counts are).
 ruff check .
 ruff format .
 mypy app
+```
+
+## Continuous Integration
+
+`.github/workflows/ci.yml` runs on every pull request and every push to
+`main`, as two jobs:
+
+- **`quality`** — a real PostgreSQL 16 service container (`github_analytics_test`
+  only), then `alembic upgrade head`, `alembic check`, a light
+  `alembic downgrade -1` / `alembic upgrade head` reversibility smoke test,
+  `pytest`, `ruff check .`, `ruff format --check .`, `mypy app`. No Redis
+  service — the test suite is deliberately designed not to need one (see
+  [Syncing pull requests and reviews](#syncing-pull-requests-and-reviews-background)).
+- **`docker-smoke`** (`needs: quality`) — builds the application image,
+  brings up the *full* `docker compose` stack against a CI-only `.env`
+  (derived from `.env.example`, with placeholder OAuth values — this job
+  never calls GitHub and never performs an OAuth login), polls `/health`
+  until it's up, then verifies `migrate` exited `0`, `worker` is still
+  running, and the Dramatiq actor imports/registers correctly
+  (`docker run --rm <image> python -c "from app.worker.tasks import
+  sync_repository_actor"` — no live Redis needed for that). Always tears
+  down with `docker compose down -v`, even on failure.
+
+These are two separate jobs specifically so `docker-smoke`'s own `db`
+service (started by Compose, mapped to host port 5432) never runs
+alongside `quality`'s GitHub Actions Postgres service container (also on
+port 5432) — combining them in one job would conflict.
+
+## Useful Docker commands
+
+```bash
+docker compose ps                    # what's running, and whether it's healthy
+docker compose logs -f api           # follow API logs
+docker compose logs -f worker        # follow worker logs
+docker compose logs migrate          # inspect the last migration run
+docker compose run --rm migrate      # apply migrations without starting the rest of the stack
+docker compose exec db psql -U postgres -d github_analytics
+docker compose down                  # stop and remove containers -- Postgres data (pgdata volume) persists
+docker compose down -v               # stop and remove containers AND the pgdata volume -- deletes your local data
 ```
 
 ## Project structure
@@ -589,7 +755,7 @@ app/
 │   ├── deps.py                  # get_db, get_github_client, get_github_oauth_client, get_current_user
 │   ├── errors.py                 # Centralized domain-exception -> HTTP status mapping
 │   └── routes/                   # API route modules
-│       ├── health.py             # GET /health
+│       ├── health.py             # GET /health, GET /ready
 │       ├── repositories.py       # GET /repositories, POST/GET/DELETE /me/repositories, /sync, /sync-jobs/{id}, /metrics
 │       └── auth.py               # GET /auth/github/login, /callback, /me, POST /auth/logout
 ├── core/
@@ -616,6 +782,7 @@ app/
 │   ├── repository_sync.py      # sync_repository() — bounded PR/review ingestion, Postgres upserts
 │   ├── repository_metrics.py   # get_repository_metrics() — Postgres-only, no GitHub calls
 │   ├── sync_jobs.py            # create_sync_job(), get_own_sync_job(), enqueue_sync_job()
+│   ├── readiness.py             # check_database_ready() — backs GET /ready, Postgres-only
 │   └── auth.py                  # OAuth state, login completion, session validation/deletion
 ├── worker/
 │   ├── broker.py                # RedisBroker + AsyncIO middleware, sets the global Dramatiq broker
@@ -628,6 +795,9 @@ app/
     └── user.py                   # UserResponse
 
 alembic/                    # Migration environment and versions
-compose.yaml                # PostgreSQL (dev + test databases) + Redis (Dramatiq queue transport)
+Dockerfile                  # Single application image, used by migrate/api/worker
+.dockerignore
+compose.yaml                # db, redis, migrate, api, worker
+.github/workflows/ci.yml    # quality job + docker-smoke job
 tests/                      # pytest suite
 ```

@@ -21,6 +21,6 @@ class User(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
-    tracked_repositories: Mapped[list["UserRepository"]] = relationship(
+    tracked_repositories: Mapped[list[UserRepository]] = relationship(
         back_populates="user", passive_deletes=True
     )

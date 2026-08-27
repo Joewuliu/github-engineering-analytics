@@ -28,4 +28,4 @@ class PullRequestReview(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
-    pull_request: Mapped["PullRequest"] = relationship(back_populates="reviews")
+    pull_request: Mapped[PullRequest] = relationship(back_populates="reviews")

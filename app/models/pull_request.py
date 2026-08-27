@@ -38,6 +38,6 @@ class PullRequest(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
-    reviews: Mapped[list["PullRequestReview"]] = relationship(
+    reviews: Mapped[list[PullRequestReview]] = relationship(
         back_populates="pull_request", passive_deletes=True
     )
