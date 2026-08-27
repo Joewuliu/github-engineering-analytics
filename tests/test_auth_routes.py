@@ -4,10 +4,12 @@ from collections.abc import Callable
 from urllib.parse import parse_qs, urlparse
 
 import httpx
+import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import Settings
 from app.models.session import Session
 from app.models.user import User
 
@@ -98,6 +100,39 @@ async def test_github_login_sets_pkce_verifier_cookie(
     assert "samesite=lax" in pkce_cookie.lower()
 
 
+async def test_github_login_cookies_not_secure_in_development(
+    async_client: AsyncClient, stub_github_oauth_client: StubOAuth
+) -> None:
+    """app_env defaults to "development" -- confirms Secure is opt-in, not
+    accidentally always-on, before the paired production test below proves
+    the opposite case."""
+    stub_github_oauth_client(lambda request: httpx.Response(200))
+
+    response = await async_client.get("/auth/github/login")
+
+    set_cookie_headers = response.headers.get_list("set-cookie")
+    assert all("secure" not in h.lower() for h in set_cookie_headers)
+
+
+async def test_github_login_cookies_are_secure_in_production(
+    async_client: AsyncClient,
+    stub_github_oauth_client: StubOAuth,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.api.routes.auth.get_settings", lambda: Settings(app_env="production"))
+    stub_github_oauth_client(lambda request: httpx.Response(200))
+
+    response = await async_client.get("/auth/github/login")
+
+    set_cookie_headers = response.headers.get_list("set-cookie")
+    state_cookie = next(h for h in set_cookie_headers if h.startswith("oauth_state="))
+    pkce_cookie = next(h for h in set_cookie_headers if h.startswith("pkce_verifier="))
+    assert "secure" in state_cookie.lower()
+    assert "secure" in pkce_cookie.lower()
+    assert "HttpOnly" in state_cookie
+    assert "samesite=lax" in state_cookie.lower()
+
+
 async def test_github_login_code_challenge_matches_verifier_cookie(
     async_client: AsyncClient, stub_github_oauth_client: StubOAuth
 ) -> None:
@@ -154,6 +189,27 @@ async def test_callback_valid_flow_creates_session_and_redirects(
     assert FAKE_ACCESS_TOKEN not in response.text
     assert CLIENT_SECRET not in response.text
     assert PKCE_VERIFIER not in response.text
+
+
+async def test_callback_session_cookie_is_secure_in_production(
+    async_client: AsyncClient,
+    stub_github_oauth_client: StubOAuth,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.api.routes.auth.get_settings", lambda: Settings(app_env="production"))
+    stub_github_oauth_client(_success_handler(github_id=101, login="octocat"))
+    _set_oauth_state_cookie(async_client, "matching-state")
+    _set_pkce_cookie(async_client)
+
+    response = await async_client.get(
+        "/auth/github/callback", params={"code": "a-code", "state": "matching-state"}
+    )
+
+    set_cookie_headers = response.headers.get_list("set-cookie")
+    session_cookie = next(h for h in set_cookie_headers if h.startswith("session="))
+    assert "secure" in session_cookie.lower()
+    assert "HttpOnly" in session_cookie
+    assert "samesite=lax" in session_cookie.lower()
 
 
 async def test_callback_missing_state_returns_400_without_calling_github(

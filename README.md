@@ -4,7 +4,7 @@ A backend application that connects to GitHub, ingests repository activity,
 and calculates engineering analytics. This project is intended to demonstrate
 production-quality backend engineering practices.
 
-## Current Status: Milestone 9 — Reproducible Dockerized Application + CI
+## Current Status: Milestone 10 (in progress) — Public Cloud Deployment
 
 Milestone 1 established the base FastAPI application. Milestone 2 added
 PostgreSQL, async SQLAlchemy 2.x, and Alembic migrations. Milestone 3 added
@@ -15,13 +15,18 @@ that stored data into engineering metrics via
 `GET /me/repositories/{repository_id}/metrics` — computed entirely from
 PostgreSQL, no GitHub calls. Milestone 8 moved repository sync off the
 request/response cycle via a Dramatiq background worker and Redis queue.
-Milestone 9 adds no new product features — it makes the existing backend
-reproducible: the whole stack (API, worker, Postgres, Redis) now runs through
-one Docker Compose command, backed by a single application image, a dedicated
-migration step, `/ready` for orchestration-aware readiness, and a GitHub
-Actions CI workflow. GitHub GraphQL, webhooks, scheduling, further analytics,
-and any actual cloud deployment still do not exist — those arrive in later
-milestones.
+Milestone 9 made the existing backend reproducible: the whole stack (API,
+worker, Postgres, Redis) runs through one Docker Compose command, backed by a
+single application image, a dedicated migration step, `/ready` for
+orchestration-aware readiness, and a GitHub Actions CI workflow. **Milestone
+10's code/configuration preparation is implemented — a live public deployment
+is not.** `pool_pre_ping` is enabled for managed-database reliability, cookie
+`Secure` behavior under `APP_ENV=production` is verified by tests, and
+[Production deployment](#production-deployment) below documents the exact
+target architecture and manual setup sequence. The application is not yet
+reachable at a public URL; that requires manually provisioning Render
+resources, which has not been done. GitHub GraphQL, webhooks, scheduling, and
+further analytics still do not exist — those arrive in later milestones.
 
 ## Quick start
 
@@ -744,6 +749,200 @@ docker compose exec db psql -U postgres -d github_analytics
 docker compose down                  # stop and remove containers -- Postgres data (pgdata volume) persists
 docker compose down -v               # stop and remove containers AND the pgdata volume -- deletes your local data
 ```
+
+## Production deployment
+
+**Production deployment target: Render.** This section documents the
+prepared architecture and manual setup sequence; the application has not
+been deployed yet, and there is no live URL. Local development is
+unaffected either way — it remains exactly the Docker Compose workflow
+described above (Option A/Option B). Production does not reuse
+`compose.yaml`'s `db`/`redis` containers at all; it uses Render's own
+managed services.
+
+### Architecture
+
+Same single application image and Dockerfile as local Docker Compose — no
+Milestone 9 architecture change. Only the *runtime commands* and *where the
+image runs* differ:
+
+- **Web Service** — the same image, running `uvicorn app.main:app`. Public,
+  gets an HTTPS URL from Render.
+- **Background Worker** — the same image, running
+  `dramatiq app.worker.tasks --processes 1 --threads 1`, unchanged from
+  Milestone 8/9. No public port, no HTTP health server — deliberately, for
+  the same reason as local Docker Compose (see
+  [Known limitations (Docker/CI)](#known-limitations-docker-ci) above);
+  independently restartable from the Web Service.
+- **Render Postgres** — durable, managed relational storage. Replaces
+  `compose.yaml`'s local `db` container in production; nothing else about
+  the SQLAlchemy/Alembic architecture changes.
+- **Render Key Value** — Render's current Redis-compatible offering (new
+  instances run Valkey internally while remaining Redis-client compatible).
+  Used purely as the Dramatiq queue transport, exactly as local Redis is
+  today — `REDIS_URL` and `dramatiq.brokers.redis.RedisBroker` need no code
+  change. PostgreSQL remains the sole source of truth for `SyncJob` status;
+  no job state moves into Key Value.
+
+No `render.yaml` yet — this first deployment is being done manually through
+Render's dashboard, deliberately, so the migration-ownership sequencing
+between two independently-deployed services (API, then worker) is proven by
+hand before it's codified as infrastructure-as-code. A later hardening step
+may generate `render.yaml` from the proven, working configuration.
+
+### Manual deployment sequence
+
+Both services' **auto-deploy is initially OFF** — the first deployment and
+its immediate follow-up checks are deliberate and manual, not triggered by
+every push to `main`. Existing GitHub Actions CI (`quality` +
+`docker-smoke`) is unchanged and must be green before a manual Render
+deploy; no Render credentials or deploy step are added to GitHub Actions.
+
+```
+CI green
+    ->
+deploy API (Render builds the image, runs the Pre-Deploy Command)
+    ->
+API Pre-Deploy Command: alembic upgrade head
+    ->
+API deployment succeeds
+    ->
+verify /health and /ready
+    ->
+deploy worker (same image, same DB/Key Value, no migration command)
+```
+
+The API service owns migration execution exclusively, via a Render
+**Pre-Deploy Command** (`alembic upgrade head`) — this requires a Web
+Service tier that supports pre-deploy commands (Render's free Web Service
+tier does not). `alembic upgrade head` is never placed in the Dockerfile's
+`CMD`, the API's start command, the worker's start command, or a worker
+pre-deploy command — the worker only ever *reads* an already-migrated
+schema. This guarantees the worker's new revision never starts against a
+schema the API hasn't already migrated. Automatic, fully independent
+API+worker deployment (no manual ordering) would need a more explicit
+orchestration or backward-compatible migration policy than this milestone
+implements — not attempted here.
+
+### Environment variables
+
+Set via Render's environment/secrets UI, never committed to the repository:
+
+```
+APP_ENV=production
+LOG_LEVEL=INFO
+DB_ECHO=false
+
+DATABASE_URL=<Render-generated host/credentials, but the SQLAlchemy+psycopg3
+              dialect scheme: postgresql+psycopg://user:password@host/database>
+REDIS_URL=<Render Key Value internal connection URL>
+
+GITHUB_OAUTH_CALLBACK_URL=https://<render-host>/auth/github/callback
+GITHUB_OAUTH_CLIENT_ID=<production OAuth App client id>
+GITHUB_OAUTH_CLIENT_SECRET=<production OAuth App client secret>
+
+GITHUB_TOKEN=<fine-grained PAT, public repositories, read-only>
+```
+
+**`DATABASE_URL` scheme**: Render's displayed internal database URL may
+begin with plain `postgresql://`. This application uses async SQLAlchemy
+with the psycopg3 driver, which requires the `postgresql+psycopg://`
+dialect prefix — paste Render's generated host/credentials/database into
+that scheme rather than the raw URL as displayed, unless direct testing at
+setup time proves Render's value already includes the correct prefix. No
+provider-specific URL-rewriting code is added to the application for
+this — it stays a manual, environment-driven configuration step, consistent
+with "no Docker/provider hostname hard-coded in source" from Milestone 9.
+
+**Render `PORT`**: Render assigns the API's listening port dynamically via
+a `PORT` environment variable (currently defaulting to `10000`). This is
+provider runtime configuration, not an application `Settings` field, and is
+handled entirely in the Render service's Start Command:
+
+```
+/bin/sh -c 'uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-10000}'
+```
+
+The Dockerfile's existing `CMD` (`--port 8000`) is unchanged for local
+Docker Compose, which continues to publish port 8000 exactly as before —
+this override exists only in Render's own service configuration.
+
+### Production GitHub OAuth App
+
+A **separate, production-only** GitHub OAuth App — the existing local dev
+OAuth App (`http://127.0.0.1:8000/auth/github/callback`) is never repointed.
+Exact steps (performed after the Render API hostname is known — see the
+manual setup checklist below): GitHub → Settings → Developer settings →
+OAuth Apps → New OAuth App; Homepage URL and Authorization callback URL
+both use `https://<render-host>/...` (callback:
+`https://<render-host>/auth/github/callback`); copy the generated Client ID
+and generate a Client Secret; set both as Render environment variables on
+the API and worker services (the worker does not perform OAuth itself, but
+receives the same application settings for consistency — see
+[Production GitHub token](#production-github-token) for why the worker
+still needs *a* token). Never shared here or pasted into chat.
+
+### Production GitHub token
+
+A public-repository, read-only, **fine-grained personal access token**,
+configured as `GITHUB_TOKEN` on both the API and worker services (both make
+outbound GitHub REST calls — tracking a repository from the API, syncing
+from the worker) — this avoids GitHub's unauthenticated 60-requests/hour
+limit. `GITHUB_TOKEN` stays optional for local development, as today.
+
+To create it (perform this yourself — do not paste the token value back):
+1. https://github.com/settings/personal-access-tokens/new
+2. **Resource owner**: your personal account.
+3. **Repository access**: "Public Repositories (read-only)" — GitHub's
+   fine-grained tokens grant this automatically; do not select "All
+   repositories" or "Only select repositories," and do not add any
+   repository or account permission beyond what's already implied by
+   public-read access.
+4. Do not grant any write, administration, or private-repository
+   permission — none is needed for repository metadata, pull-request
+   listing, or review listing, all of which are covered by public-read
+   access alone.
+5. **Expiration**: set one (e.g. 90 days) rather than "No expiration" —
+   plan to rotate it before it lapses.
+6. Generate, then paste the value directly into Render's environment
+   variable UI for `GITHUB_TOKEN` on both services — never into this
+   repository, a commit, or this chat.
+
+### Health checks in production
+
+- `GET /health` — Render's own platform health check (liveness). Unchanged
+  from Milestone 9: dependency-free, so a transient Postgres blip doesn't
+  make Render kill/restart an otherwise-healthy API instance.
+- `GET /ready` — used for manual deployment-readiness verification (see the
+  setup checklist), not wired into Render's own restart-triggering health
+  check. Checks PostgreSQL only via `SELECT 1`; still never checks GitHub
+  or Key Value, unchanged reasoning from Milestone 9.
+
+### Cost
+
+The production architecture requires paid resources for the durable
+worker/data configuration; verify current Render pricing before
+provisioning. Concretely, at the time this was written: Render Background
+Workers have no free instance type; Pre-Deploy Commands require a paid
+web/private/worker service tier; a free Render Postgres instance is not
+appropriate for durable portfolio data because its lifecycle is
+time-limited; genuine Key Value persistence requires a paid tier. No dollar
+figures are hard-coded here since Render's pricing changes — check the
+Render dashboard directly before creating any resource.
+
+### Known limitations
+
+- **Worker-crash-mid-job**: unchanged from Milestone 8/9 — if the worker
+  process is restarted (crash, redeploy, OOM) while a `SyncJob` is
+  `running`, that row stays `running` indefinitely; no heartbeat/stale-job
+  recovery exists. Deploying to Render does not change this behavior, only
+  where it can happen.
+- **No `render.yaml` yet** — deployment is manual; a later hardening step
+  may codify the proven configuration as a Blueprint.
+- **Auto-deploy is off** — pushes to `main` do not currently redeploy
+  either service; deploys are triggered manually from the Render dashboard.
+- **No custom domain** — the production URL, once deployed, will be
+  Render's provided `*.onrender.com` HTTPS hostname.
 
 ## Project structure
 

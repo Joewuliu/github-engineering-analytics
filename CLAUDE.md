@@ -268,13 +268,56 @@ Milestones 1–9 are complete:
   proxy/HTTPS, no cloud deployment, and no worker HTTP health check
   (deliberately) were introduced.
 
+**Milestone 10 (public cloud deployment): deployment preparation
+implemented; live Render deployment pending manual provisioning/
+verification.** Milestone 10 is not complete — no Render resources have
+been created, and there is no live URL. What's implemented so far:
+`app/db/session.py`'s engine now sets `pool_pre_ping=True` (a cheap
+liveness check before handing out a pooled connection, so a managed
+Postgres instance silently dropping an idle connection surfaces as a
+transparent reconnect rather than a confusing mid-request failure) —
+`pool_size`/`max_overflow`/session architecture are unchanged, since
+nothing at this project's scale (one API instance + one worker instance)
+demonstrates a need to tune them. `tests/test_auth_routes.py` gained tests
+proving `APP_ENV=production` actually produces `Secure` cookies (via
+monkeypatching `app.api.routes.auth.get_settings`, since this behavior —
+`_cookie_secure()` — already existed since Milestone 4 but had no direct
+test coverage) alongside a paired test proving `Secure` is *absent* by
+default; `tests/test_db.py` gained a small configuration-guard test
+(`engine.pool._pre_ping is True`) rather than attempting to simulate actual
+stale-connection recovery. Render was confirmed (not merely assumed) as the
+target platform, with corrected terminology and cost assumptions from the
+original plan: the product is **Render Key Value** (Valkey-backed, Redis-
+client-compatible), not "managed Redis"; Background Workers have no free
+instance type, Pre-Deploy Commands require a paid tier, and free Postgres
+is unsuitable for durable data — the README states this as "verify current
+Render pricing before provisioning" rather than hard-coding dollar figures
+that will drift. `README.md`'s new "Production deployment" section
+documents the full manual setup sequence (provision Postgres/Key Value →
+deploy API with `alembic upgrade head` as its Pre-Deploy Command → verify
+`/health`/`/ready` → only then deploy the worker), why the API exclusively
+owns migrations (never the worker, never inside any process's own start
+command), the `DATABASE_URL` scheme caveat (Render may display
+`postgresql://`; this app's async SQLAlchemy + psycopg3 stack needs
+`postgresql+psycopg://`), the `PORT`-via-`${PORT:-10000}` Render Start
+Command (the Dockerfile's own `CMD`/local Compose's port 8000 are
+unchanged), the separate production-only GitHub OAuth App, and exact
+(non-interactive, no-token-paste) instructions for creating a fine-grained,
+public-repositories-read-only, expiring `GITHUB_TOKEN`. Deliberately not
+done in this step: no `render.yaml` (this first deployment is being proven
+manually before being codified — see README), no GitHub Actions deploy
+step or Render credentials in CI, auto-deploy left OFF on both services.
+The CI workflow itself is unchanged from Milestone 9.
+
 Do not implement ARQ, Celery, or RQ; background retries; scheduling/cron;
 GitHub webhooks; job cancellation; job progress percentages; a job-listing
 endpoint; stale-job recovery/heartbeats; Redis persistence tuning; additional
 OAuth providers; password authentication; GitHub GraphQL; commit ingestion;
 issue ingestion; contributors; organizations; team analytics; time-series/
 trend metrics; percentile-based metrics (p90/p95/etc.); frontend/dashboard;
-cloud deployment (AWS/GCP/Azure), Kubernetes, Terraform, Helm, a reverse
-proxy/nginx, HTTPS/domain configuration, a dependency-manager migration, an
-observability platform, role-based authorization; or an admin system until
-their respective milestones.
+cloud deployment on AWS/GCP/Azure, Kubernetes, Terraform, Helm, a reverse
+proxy/nginx, a custom domain, a dependency-manager migration, an
+observability platform, role-based authorization, an admin system,
+`render.yaml`/infrastructure-as-code, automatic/CI-triggered deployment, or
+actually creating any Render resource, until their respective milestones or
+until Milestone 10's manual deployment is explicitly performed.

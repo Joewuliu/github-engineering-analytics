@@ -4,6 +4,8 @@ from app.config import get_settings
 
 settings = get_settings()
 
-engine: AsyncEngine = create_async_engine(settings.database_url, echo=settings.db_echo)
+engine: AsyncEngine = create_async_engine(
+    settings.database_url, echo=settings.db_echo, pool_pre_ping=True
+)
 
 async_session_factory = async_sessionmaker(engine, expire_on_commit=False)
