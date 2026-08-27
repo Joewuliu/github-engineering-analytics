@@ -16,6 +16,7 @@ from app.services.auth import (
     UnauthenticatedError,
     get_valid_session_user,
 )
+from app.services.sync_jobs import EnqueueSyncJob, enqueue_sync_job
 
 
 async def get_db() -> AsyncIterator[AsyncSession]:
@@ -51,3 +52,7 @@ async def get_current_user(request: Request, db: Annotated[AsyncSession, Depends
     if not raw_token:
         raise UnauthenticatedError
     return await get_valid_session_user(db, raw_token)
+
+
+def get_enqueue_sync_job() -> EnqueueSyncJob:
+    return enqueue_sync_job

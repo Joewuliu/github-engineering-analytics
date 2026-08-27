@@ -10,6 +10,7 @@ from app.models import (
     pull_request_review,  # noqa: F401  (registers models on Base.metadata)
     repository,  # noqa: F401  (registers models on Base.metadata)
     session,  # noqa: F401  (registers models on Base.metadata)
+    sync_job,  # noqa: F401  (registers models on Base.metadata)
     user,  # noqa: F401  (registers models on Base.metadata)
     user_repository,  # noqa: F401  (registers models on Base.metadata)
 )

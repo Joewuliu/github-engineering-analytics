@@ -13,7 +13,6 @@ from app.models.pull_request_review import PullRequestReview
 from app.models.repository import Repository
 from app.models.user import User
 from app.models.user_repository import UserRepository
-from app.services.repositories import RepositoryNotTrackedError
 from app.services.repository_sync import sync_repository
 
 
@@ -86,28 +85,6 @@ async def _make_tracked_repository(
     return repository
 
 
-async def test_sync_repository_raises_when_repository_does_not_exist(
-    db_session: AsyncSession,
-) -> None:
-    user = await _make_user(db_session, 1, "octocat")
-    github_client = _github_client([])
-
-    with pytest.raises(RepositoryNotTrackedError):
-        await sync_repository(999999, user, db_session, github_client)
-
-
-async def test_sync_repository_raises_when_not_tracked_by_current_user(
-    db_session: AsyncSession,
-) -> None:
-    owner = await _make_user(db_session, 2, "owner")
-    other = await _make_user(db_session, 3, "other")
-    repository = await _make_tracked_repository(db_session, owner, 500, "octocat/private-ish")
-    github_client = _github_client([])
-
-    with pytest.raises(RepositoryNotTrackedError):
-        await sync_repository(repository.id, other, db_session, github_client)
-
-
 async def test_sync_repository_first_sync_inserts_prs_and_reviews(db_session: AsyncSession) -> None:
     user = await _make_user(db_session, 4, "octocat")
     repository = await _make_tracked_repository(db_session, user, 501, "octocat/repo-a")
@@ -116,11 +93,10 @@ async def test_sync_repository_first_sync_inserts_prs_and_reviews(db_session: As
         {1: [_review(2001)], 2: [_review(2002), _review(2003)]},
     )
 
-    result_repo, pr_count, review_count = await sync_repository(
-        repository.id, user, db_session, github_client
+    pr_count, review_count = await sync_repository(
+        repository.id, repository.full_name, db_session, github_client
     )
 
-    assert result_repo.id == repository.id
     assert pr_count == 2
     assert review_count == 3
 
@@ -140,8 +116,8 @@ async def test_sync_repository_repeated_identical_sync_creates_no_duplicates(
     repository = await _make_tracked_repository(db_session, user, 502, "octocat/repo-b")
     github_client = _github_client([_pr(1003, 1)], {1: [_review(2004)]})
 
-    await sync_repository(repository.id, user, db_session, github_client)
-    await sync_repository(repository.id, user, db_session, github_client)
+    await sync_repository(repository.id, repository.full_name, db_session, github_client)
+    await sync_repository(repository.id, repository.full_name, db_session, github_client)
 
     prs = await db_session.execute(
         select(PullRequest).where(PullRequest.repository_id == repository.id)
@@ -157,7 +133,7 @@ async def test_sync_repository_updates_mutable_pr_fields(db_session: AsyncSessio
     repository = await _make_tracked_repository(db_session, user, 503, "octocat/repo-c")
 
     first_client = _github_client([_pr(1004, 1, state="open", title="WIP")])
-    await sync_repository(repository.id, user, db_session, first_client)
+    await sync_repository(repository.id, repository.full_name, db_session, first_client)
 
     second_client = _github_client(
         [
@@ -171,7 +147,7 @@ async def test_sync_repository_updates_mutable_pr_fields(db_session: AsyncSessio
             )
         ]
     )
-    await sync_repository(repository.id, user, db_session, second_client)
+    await sync_repository(repository.id, repository.full_name, db_session, second_client)
 
     result = await db_session.execute(select(PullRequest).where(PullRequest.github_id == 1004))
     pull_request = result.scalar_one()
@@ -189,13 +165,13 @@ async def test_sync_repository_updates_author_login(db_session: AsyncSession) ->
 
     await sync_repository(
         repository.id,
-        user,
+        repository.full_name,
         db_session,
         _github_client([_pr(1005, 1, user={"login": "old-name"})]),
     )
     await sync_repository(
         repository.id,
-        user,
+        repository.full_name,
         db_session,
         _github_client([_pr(1005, 1, user={"login": "new-name"})]),
     )
@@ -212,7 +188,7 @@ async def test_sync_repository_updates_review_state_and_reviewer_login(
 
     await sync_repository(
         repository.id,
-        user,
+        repository.full_name,
         db_session,
         _github_client(
             [_pr(1006, 1)], {1: [_review(2005, state="APPROVED", user={"login": "old-reviewer"})]}
@@ -220,7 +196,7 @@ async def test_sync_repository_updates_review_state_and_reviewer_login(
     )
     await sync_repository(
         repository.id,
-        user,
+        repository.full_name,
         db_session,
         _github_client(
             [_pr(1006, 1)],
@@ -240,9 +216,14 @@ async def test_sync_repository_inserts_review_added_on_later_sync(db_session: As
     user = await _make_user(db_session, 9, "octocat")
     repository = await _make_tracked_repository(db_session, user, 506, "octocat/repo-f")
 
-    await sync_repository(repository.id, user, db_session, _github_client([_pr(1007, 1)], {1: []}))
     await sync_repository(
-        repository.id, user, db_session, _github_client([_pr(1007, 1)], {1: [_review(2006)]})
+        repository.id, repository.full_name, db_session, _github_client([_pr(1007, 1)], {1: []})
+    )
+    await sync_repository(
+        repository.id,
+        repository.full_name,
+        db_session,
+        _github_client([_pr(1007, 1)], {1: [_review(2006)]}),
     )
 
     result = await db_session.execute(
@@ -257,7 +238,7 @@ async def test_sync_repository_requests_bounded_per_page(db_session: AsyncSessio
     captured: list[httpx.Request] = []
     github_client = _github_client([], captured=captured)
 
-    await sync_repository(repository.id, user, db_session, github_client)
+    await sync_repository(repository.id, repository.full_name, db_session, github_client)
 
     pulls_request = next(r for r in captured if r.url.path.endswith("/pulls"))
     assert pulls_request.url.params["per_page"] == "25"
@@ -267,6 +248,7 @@ async def test_sync_repository_rolls_back_on_persistence_failure(db_session: Asy
     user = await _make_user(db_session, 11, "octocat")
     repository = await _make_tracked_repository(db_session, user, 508, "octocat/repo-h")
     repository_id = repository.id
+    full_name = repository.full_name
     github_client = _github_client([_pr(1008, 1)], {1: [_review(2007)]})
 
     with (
@@ -275,7 +257,7 @@ async def test_sync_repository_rolls_back_on_persistence_failure(db_session: Asy
         ),
         pytest.raises(IntegrityError),
     ):
-        await sync_repository(repository_id, user, db_session, github_client)
+        await sync_repository(repository_id, full_name, db_session, github_client)
 
     # sync_repository deliberately does not catch/rollback a commit failure
     # itself -- in the real request lifecycle, get_db()'s dependency rolls
@@ -318,4 +300,4 @@ async def test_sync_repository_number_collision_with_different_github_id_raises(
     github_client = _github_client([_pr(9002, 1)])
 
     with pytest.raises(IntegrityError):
-        await sync_repository(repository.id, user, db_session, github_client)
+        await sync_repository(repository.id, repository.full_name, db_session, github_client)

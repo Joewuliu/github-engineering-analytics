@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     database_url: str = "postgresql+psycopg://postgres:postgres@localhost:5432/github_analytics"
     db_echo: bool = False
+    redis_url: str = "redis://localhost:6379/0"
     github_api_base_url: str = "https://api.github.com"
     github_token: str | None = None
     github_request_timeout: float = Field(default=10.0, gt=0)

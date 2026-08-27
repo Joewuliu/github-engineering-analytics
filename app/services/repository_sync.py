@@ -6,9 +6,6 @@ from app.github.client import GitHubClient
 from app.github.schemas import GitHubPullRequest, GitHubReview
 from app.models.pull_request import PullRequest
 from app.models.pull_request_review import PullRequestReview
-from app.models.repository import Repository
-from app.models.user import User
-from app.services.repositories import get_tracked_repository
 
 # Milestone 6 deliberately bounds sync to a small, fixed window: each pull
 # request requires its own separate GitHub "list reviews" request, so a
@@ -19,33 +16,39 @@ MAX_PULL_REQUESTS_PER_SYNC = 25
 
 
 async def sync_repository(
-    repository_id: int, user: User, db: AsyncSession, github_client: GitHubClient
-) -> tuple[Repository, int, int]:
-    """Fetch this user's tracked repository's recent PRs/reviews and persist them.
+    repository_id: int, full_name: str, db: AsyncSession, github_client: GitHubClient
+) -> tuple[int, int]:
+    """Fetch a repository's recent PRs/reviews from GitHub and persist them.
+
+    Takes plain repository identity (repository_id/full_name) rather than a
+    loaded Repository ORM instance, and no longer performs any
+    authorization check itself (see get_tracked_repository in
+    repositories.py, called once by the caller before this runs) -- as of
+    Milestone 8 this only ever runs inside the background worker
+    (app/worker/tasks.py), which has no browser session/User to check
+    against and must not hold a database session across the many GitHub
+    HTTP calls below.
 
     All GitHub calls happen before any database write: the full bounded PR
     list and every PR's reviews are fetched and held in memory first, then
-    persistence happens as a single all-or-nothing transaction.
+    persistence happens as a single all-or-nothing transaction using
+    whichever session the caller passes in.
     """
-    repository = await get_tracked_repository(repository_id, user, db)
-
-    github_prs = await github_client.list_pull_requests(
-        repository.full_name, limit=MAX_PULL_REQUESTS_PER_SYNC
-    )
+    github_prs = await github_client.list_pull_requests(full_name, limit=MAX_PULL_REQUESTS_PER_SYNC)
     reviews_by_pr: dict[int, list[GitHubReview]] = {
-        github_pr.id: await github_client.list_reviews(repository.full_name, github_pr.number)
+        github_pr.id: await github_client.list_reviews(full_name, github_pr.number)
         for github_pr in github_prs
     }
 
     for github_pr in github_prs:
-        pull_request_id = await _upsert_pull_request(db, repository.id, github_pr)
+        pull_request_id = await _upsert_pull_request(db, repository_id, github_pr)
         for github_review in reviews_by_pr[github_pr.id]:
             await _upsert_review(db, pull_request_id, github_review)
 
     await db.commit()
 
     reviews_processed = sum(len(reviews) for reviews in reviews_by_pr.values())
-    return repository, len(github_prs), reviews_processed
+    return len(github_prs), reviews_processed
 
 
 async def _upsert_pull_request(

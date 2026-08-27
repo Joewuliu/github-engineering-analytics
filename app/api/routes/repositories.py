@@ -1,10 +1,11 @@
 from typing import Annotated
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_current_user, get_db, get_github_client
+from app.api.deps import get_current_user, get_db, get_enqueue_sync_job, get_github_client
 from app.github.client import GitHubClient
 from app.models.repository import Repository
 from app.models.user import User
@@ -15,13 +16,13 @@ from app.schemas.repository import (
     RepositoryResponse,
     TrackedRepositoryResponse,
 )
-from app.schemas.sync import RepositorySyncResponse
+from app.schemas.sync_job import SyncJobCreatedResponse, SyncJobResponse
 from app.services.repositories import (
     track_repository_for_user,
     untrack_repository_for_user,
 )
 from app.services.repository_metrics import get_repository_metrics
-from app.services.repository_sync import sync_repository
+from app.services.sync_jobs import EnqueueSyncJob, create_sync_job, get_own_sync_job
 
 router = APIRouter()
 
@@ -81,21 +82,39 @@ async def untrack_repository(
     await untrack_repository_for_user(repository_id, user=current_user, db=db)
 
 
-@router.post("/me/repositories/{repository_id}/sync", response_model=RepositorySyncResponse)
+@router.post(
+    "/me/repositories/{repository_id}/sync",
+    response_model=SyncJobCreatedResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
 async def sync_tracked_repository(
     repository_id: int,
     db: Annotated[AsyncSession, Depends(get_db)],
-    github_client: Annotated[GitHubClient, Depends(get_github_client)],
     current_user: Annotated[User, Depends(get_current_user)],
-) -> RepositorySyncResponse:
-    repository, pr_count, review_count = await sync_repository(
-        repository_id, user=current_user, db=db, github_client=github_client
-    )
-    return RepositorySyncResponse(
-        repository_id=repository.id,
-        full_name=repository.full_name,
-        pull_requests_processed=pr_count,
-        reviews_processed=review_count,
+    enqueue: Annotated[EnqueueSyncJob, Depends(get_enqueue_sync_job)],
+) -> SyncJobCreatedResponse:
+    job = await create_sync_job(repository_id, user=current_user, db=db, enqueue=enqueue)
+    return SyncJobCreatedResponse(job_id=job.id, repository_id=job.repository_id, status=job.status)
+
+
+@router.get("/me/sync-jobs/{job_id}", response_model=SyncJobResponse)
+async def get_sync_job(
+    job_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[User, Depends(get_current_user)],
+) -> SyncJobResponse:
+    job = await get_own_sync_job(job_id, user=current_user, db=db)
+    return SyncJobResponse(
+        job_id=job.id,
+        repository_id=job.repository_id,
+        status=job.status,
+        pull_requests_processed=job.pull_requests_processed,
+        reviews_processed=job.reviews_processed,
+        created_at=job.created_at,
+        started_at=job.started_at,
+        finished_at=job.finished_at,
+        safe_error_code=job.safe_error_code,
+        safe_error_message=job.safe_error_message,
     )
 
 

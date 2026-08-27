@@ -24,6 +24,11 @@ from app.services.auth import (
     UnauthenticatedError,
 )
 from app.services.repositories import RepositoryAlreadyTrackedError, RepositoryNotTrackedError
+from app.services.sync_jobs import (
+    RepositorySyncAlreadyActiveError,
+    SyncJobEnqueueError,
+    SyncJobNotFoundError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +47,9 @@ _ERROR_MAPPING: dict[type[Exception], tuple[int, str]] = {
     RepositoryNotTrackedError: (404, "Repository not found."),
     GitHubOAuthNotConfiguredError: (500, "GitHub OAuth is not configured."),
     UnauthenticatedError: (401, "Not authenticated."),
+    RepositorySyncAlreadyActiveError: (409, "Repository sync already in progress."),
+    SyncJobEnqueueError: (503, "Could not schedule the sync job. Try again later."),
+    SyncJobNotFoundError: (404, "Sync job not found."),
 }
 
 # These are the pre-token-exchange callback validation failures: state

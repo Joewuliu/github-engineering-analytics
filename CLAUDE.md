@@ -55,7 +55,7 @@ When completing a milestone:
 
 ## Current Milestone
 
-Milestones 1–7 are complete:
+Milestones 1–8 are complete:
 
 - Milestone 1: FastAPI backend foundation.
 - Milestone 2: PostgreSQL via Docker Compose, async SQLAlchemy 2.x, Alembic
@@ -131,11 +131,77 @@ Milestones 1–7 are complete:
   rounded, cached, or persisted inside the service — rounding to 2 decimal
   places happens only at the API response boundary in
   `app/api/routes/repositories.py`. No schema change was required.
+- Milestone 8: durable background repository sync jobs. `POST
+  /me/repositories/{repository_id}/sync` no longer performs GitHub
+  ingestion itself — it authorizes via `get_tracked_repository()`, creates a
+  `SyncJob(status="queued")` row, and enqueues the job id (as a plain
+  string, never an ORM object) to a Dramatiq actor, returning `202` with
+  `{job_id, repository_id, status}`. `GET /me/sync-jobs/{job_id}`
+  (authenticated, owner-only — same never-reveal-existence 404 for a
+  nonexistent job and one owned by another user) polls status. Queue:
+  Dramatiq + Redis (`app/worker/broker.py`, `RedisBroker` +
+  the `AsyncIO` middleware so actors run as native `async def`), chosen
+  over ARQ (maintenance-only) and Celery/RQ (fork-based worker models that
+  fight Windows); Redis is transport only, no results backend — job status
+  lives entirely in Postgres. The actor (`app/worker/tasks.py`) is
+  registered with `max_retries=0`: one queue delivery is one sync attempt,
+  deliberately no automatic retry this milestone. `sync_repository()`
+  (`app/services/repository_sync.py`) was refactored to accept
+  `repository_id`/`full_name` instead of a loaded `Repository` and a `user`
+  — ingestion is now worker-only and never performs authorization itself.
+  The worker never holds one long-lived database session: it opens and
+  closes a separate short-lived `AsyncSession` (from the same
+  `async_session_factory` the rest of the app uses) for each of marking the
+  job `running`, performing ingestion, and marking it
+  `succeeded`/`failed`, so nothing is held open across the many GitHub HTTP
+  calls in between; similarly, one `httpx.AsyncClient` is opened per job via
+  `async with`, not pooled worker-wide. `SyncJob`
+  (`app/models/sync_job.py`) has a UUID primary key (client-facing job ids,
+  to deter enumeration — the actual authorization boundary is the
+  owner-only check), a `status` `CHECK` constraint restricting to
+  `queued`/`running`/`succeeded`/`failed`, `ON DELETE CASCADE` FKs to both
+  `users` and `repositories`, and a partial unique index
+  (`repository_id` unique `WHERE status IN ('queued', 'running')`) that is
+  the actual correctness boundary for "at most one active sync per
+  canonical repository" — enforced at the database level even under
+  concurrent requests, with an application-level pre-check in
+  `app/services/sync_jobs.py` only for a cleaner error path and an
+  `IntegrityError` catch as the race fallback. A duplicate active sync
+  (regardless of which user owns the existing job — `Repository` is a
+  single global row) returns `409` without revealing the existing job's id,
+  since the caller might not own it and couldn't `GET` it anyway. An
+  enqueue failure (Redis/Dramatiq unreachable) marks the just-created job
+  `failed` (`safe_error_code="enqueue_failed"`) rather than leaving a
+  phantom `queued` row, and returns `503`. Worker failures map to a small
+  fixed `safe_error_code`/`safe_error_message` vocabulary (never
+  `str(exception)` or a traceback) via an `isinstance`-ordered lookup in
+  `app/worker/tasks.py`. A worker crash between `running` and a terminal
+  state leaves that job stuck `running` forever (and, via the partial
+  unique index, blocks future syncs for that repository) — a documented,
+  accepted limitation; no heartbeat/stale-job sweep exists. `GET
+  /me/repositories/{repository_id}/metrics` is unchanged and still makes
+  zero GitHub calls. One additive migration (`sync_jobs` table only).
+  `compose.yaml` gained a `redis:7-alpine` service (queue transport only,
+  no persistence configured, no results backend). Local dev is three
+  processes: `docker compose up -d` (Postgres + Redis), `uvicorn
+  app.main:app --reload`, and `dramatiq app.worker.tasks --processes 1
+  --threads 1` (one process/thread is a Milestone 8 choice for predictable
+  GitHub rate-limit usage and easy manual observation, not an
+  architectural limit — the partial unique index, not worker concurrency,
+  is what enforces correctness). On Windows, `app/worker/broker.py`
+  explicitly sets `WindowsSelectorEventLoopPolicy` before Dramatiq's
+  `AsyncIO` middleware starts its event-loop thread, and
+  `app/worker/tasks.py` explicitly imports every model module (mirroring
+  `tests/conftest.py`/`alembic/env.py`) — both were real bugs caught only
+  by running the actual worker process end-to-end against live
+  Postgres/Redis, not by the (fully offline, Redis-free) automated test
+  suite.
 
-Do not implement additional OAuth providers, password authentication, GitHub
-GraphQL, GitHub webhooks, commit ingestion, issue ingestion, contributors,
-organizations, team analytics, time-series/trend metrics, percentile-based
-metrics (p90/p95/etc.), frontend/dashboard, Redis, caching, background
-workers, retry infrastructure, CI/CD, deployment infrastructure,
-role-based authorization, or an admin system until their respective
-milestones.
+Do not implement ARQ, Celery, or RQ; background retries; scheduling/cron;
+GitHub webhooks; job cancellation; job progress percentages; a job-listing
+endpoint; stale-job recovery/heartbeats; Redis persistence tuning; additional
+OAuth providers; password authentication; GitHub GraphQL; commit ingestion;
+issue ingestion; contributors; organizations; team analytics; time-series/
+trend metrics; percentile-based metrics (p90/p95/etc.); frontend/dashboard;
+CI/CD; deployment infrastructure; app containerization; role-based
+authorization; or an admin system until their respective milestones.

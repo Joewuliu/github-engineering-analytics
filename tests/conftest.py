@@ -2,6 +2,7 @@ import asyncio
 import sys
 from collections.abc import AsyncIterator, Callable, Iterator
 from datetime import UTC, datetime, timedelta
+from uuid import UUID
 
 import httpx
 import pytest
@@ -9,9 +10,9 @@ import pytest_asyncio
 from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.engine import make_url
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
-from app.api.deps import get_db, get_github_client, get_github_oauth_client
+from app.api.deps import get_db, get_enqueue_sync_job, get_github_client, get_github_oauth_client
 from app.config import get_settings
 from app.core.security import hash_token
 from app.db.base import Base
@@ -23,6 +24,7 @@ from app.models import pull_request as pull_request_model  # noqa: F401  (regist
 from app.models import pull_request_review as pull_request_review_model  # noqa: F401
 from app.models import repository as repository_model  # noqa: F401  (registers table)
 from app.models import session as session_model  # noqa: F401  (registers table)
+from app.models import sync_job as sync_job_model  # noqa: F401  (registers table)
 from app.models import user as user_model  # noqa: F401  (registers table)
 from app.models import user_repository as user_repository_model  # noqa: F401  (registers table)
 from app.models.session import Session
@@ -66,15 +68,39 @@ async def _create_schema(_verify_test_database: None) -> AsyncIterator[None]:
 
 
 @pytest_asyncio.fixture
-async def db_session(_create_schema: None) -> AsyncIterator[AsyncSession]:
+async def db_connection(_create_schema: None) -> AsyncIterator[AsyncConnection]:
     async with engine.connect() as connection:
         await connection.begin()
-        session = AsyncSession(
-            bind=connection, join_transaction_mode="create_savepoint", expire_on_commit=False
-        )
-        async with session:
-            yield session
+        yield connection
         await connection.rollback()
+
+
+@pytest_asyncio.fixture
+async def db_session(db_connection: AsyncConnection) -> AsyncIterator[AsyncSession]:
+    session = AsyncSession(
+        bind=db_connection, join_transaction_mode="create_savepoint", expire_on_commit=False
+    )
+    async with session:
+        yield session
+
+
+@pytest.fixture
+def db_session_factory(db_connection: AsyncConnection) -> Callable[[], AsyncSession]:
+    """Builds a fresh AsyncSession per call, all bound to the same
+    rollback-guarded test connection.
+
+    Lets a test exercise code (like the background worker) that opens and
+    closes several independent sessions in sequence -- matching real
+    production shape -- while everything still participates in, and is
+    undone by, the single outer test transaction.
+    """
+
+    def _factory() -> AsyncSession:
+        return AsyncSession(
+            bind=db_connection, join_transaction_mode="create_savepoint", expire_on_commit=False
+        )
+
+    return _factory
 
 
 @pytest_asyncio.fixture
@@ -120,6 +146,33 @@ def stub_github_oauth_client() -> Iterator[
 
     yield _use
     app.dependency_overrides.pop(get_github_oauth_client, None)
+
+
+class FakeEnqueue:
+    """Records job ids handed to enqueue_sync_job instead of touching Redis."""
+
+    def __init__(self) -> None:
+        self.enqueued: list[UUID] = []
+        self.raise_error: Exception | None = None
+
+    async def __call__(self, job_id: UUID) -> None:
+        if self.raise_error is not None:
+            raise self.raise_error
+        self.enqueued.append(job_id)
+
+
+@pytest.fixture
+def stub_enqueue_sync_job() -> Iterator[FakeEnqueue]:
+    """Overrides the sync route's enqueue dependency with an in-memory fake.
+
+    No live Redis/Dramatiq broker is required for the ordinary test suite --
+    this is the same dependency-injection seam stub_github_client already
+    uses for the GitHub client.
+    """
+    fake = FakeEnqueue()
+    app.dependency_overrides[get_enqueue_sync_job] = lambda: fake
+    yield fake
+    app.dependency_overrides.pop(get_enqueue_sync_job, None)
 
 
 @pytest_asyncio.fixture

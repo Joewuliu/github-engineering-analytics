@@ -4,24 +4,27 @@ A backend application that connects to GitHub, ingests repository activity,
 and calculates engineering analytics. This project is intended to demonstrate
 production-quality backend engineering practices.
 
-## Current Status: Milestone 7 — Repository Engineering Analytics
+## Current Status: Milestone 8 — Durable Background Repository Sync Jobs
 
 Milestone 1 established the base FastAPI application. Milestone 2 added
 PostgreSQL, async SQLAlchemy 2.x, and Alembic migrations. Milestone 3 added
 GitHub REST API integration. Milestone 4 added "Sign in with GitHub" (OAuth
 with PKCE, server-side sessions). Milestone 5 introduced per-user repository
-tracking. Milestone 6 ingested pull requests and reviews via
-`POST /me/repositories/{repository_id}/sync`. Milestone 7 turns that stored
-data into the first engineering metrics via
+tracking. Milestone 6 ingested pull requests and reviews. Milestone 7 turned
+that stored data into engineering metrics via
 `GET /me/repositories/{repository_id}/metrics` — computed entirely from
-PostgreSQL, no GitHub calls. GitHub GraphQL, webhooks, Redis, background
-workers, and further analytics (trends, contributor/team breakdowns) still do
-not exist — those arrive in later milestones.
+PostgreSQL, no GitHub calls. Milestone 8 moves repository sync off the
+request/response cycle: `POST /me/repositories/{repository_id}/sync` now
+returns `202 Accepted` immediately and does the actual GitHub fetching in a
+Dramatiq background worker, with `GET /me/sync-jobs/{job_id}` for polling
+status. GitHub GraphQL, webhooks, scheduling, and further analytics (trends,
+contributor/team breakdowns) still do not exist — those arrive in later
+milestones.
 
 ## Requirements
 
 - Python 3.12+
-- Docker and Docker Compose (for PostgreSQL)
+- Docker and Docker Compose (for PostgreSQL and Redis)
 
 ## Setup
 
@@ -42,25 +45,30 @@ Copy `.env.example` to `.env` and adjust values as needed:
 cp .env.example .env
 ```
 
-## Database (PostgreSQL via Docker Compose)
+## Database and queue (PostgreSQL + Redis via Docker Compose)
 
-`compose.yaml` runs a single PostgreSQL container. On first start it creates
-two databases: `github_analytics` (development) and `github_analytics_test`
-(used only by the test suite), via `docker/postgres/init-test-db.sql`.
+`compose.yaml` runs a PostgreSQL container and a Redis container. On first
+start Postgres creates two databases: `github_analytics` (development) and
+`github_analytics_test` (used only by the test suite), via
+`docker/postgres/init-test-db.sql`. Redis (`redis:7-alpine`) is used purely
+as the Dramatiq queue transport for background repository sync (see
+[Syncing pull requests and reviews](#syncing-pull-requests-and-reviews-background))
+— it has no persistence configured and holds no data that needs to survive a
+restart except in-flight queued jobs.
 
-Start it:
+Start both:
 
 ```bash
-docker compose up -d db
+docker compose up -d
 ```
 
-Stop it (data persists in the `pgdata` volume):
+Stop them (Postgres data persists in the `pgdata` volume):
 
 ```bash
-docker compose stop db
+docker compose stop
 ```
 
-Stop and remove it, including all data:
+Stop and remove everything, including all Postgres data:
 
 ```bash
 docker compose down -v
@@ -118,7 +126,8 @@ after everyone stops tracking it (no garbage collection).
 | `POST /me/repositories` | Yes | Track a repository for the current user (see below) |
 | `GET /me/repositories` | Yes | List repositories the current user tracks, most recently tracked first |
 | `DELETE /me/repositories/{repository_id}` | Yes | Stop tracking a repository (idempotent) |
-| `POST /me/repositories/{repository_id}/sync` | Yes | Ingest PRs/reviews for a tracked repository (see below) |
+| `POST /me/repositories/{repository_id}/sync` | Yes | Enqueue a background sync job for a tracked repository (see below) |
+| `GET /me/sync-jobs/{job_id}` | Yes | Poll a sync job's status (see below) |
 | `GET /me/repositories/{repository_id}/metrics` | Yes | Compute engineering metrics from stored data (see below) |
 
 ### Tracking a repository
@@ -172,54 +181,204 @@ canonical `Repository` is never touched.
 curl http://127.0.0.1:8000/repositories
 ```
 
-## Syncing pull requests and reviews
+## Syncing pull requests and reviews (background)
 
-```bash
-curl -X POST http://127.0.0.1:8000/me/repositories/<repository_id>/sync --cookie "session=..."
-```
-
-Fetches this repository's pull requests from GitHub (`state=all`, newest
-first) and every fetched PR's reviews, then persists them. Requires
-authentication and that you track `repository_id`; both a nonexistent
-repository and one you don't track return the same 404, so the endpoint never
-reveals whether an untracked repository exists globally.
+Sync fetches this repository's pull requests from GitHub (`state=all`,
+newest first) and every fetched PR's reviews, then persists them. As of
+Milestone 8 this happens in a background worker, not inside the HTTP
+request — the endpoint only creates a durable job record and hands it to a
+queue.
 
 **Bounded to the most recent `MAX_PULL_REQUESTS_PER_SYNC` = 25 pull requests**
 (`app/services/repository_sync.py`) — deliberately small and easy to find/
 replace later. Each PR needs its own separate GitHub "list reviews" request,
 so a larger limit multiplies outbound API calls quickly; 25 keeps a sync
 usable even without `GITHUB_TOKEN` configured (GitHub's unauthenticated limit
-is 60 requests/hour). Real full-history or incremental sync is deferred to
-whenever background workers are introduced — this milestone is a bounded,
-synchronous demonstration.
+is 60 requests/hour). Real full-history or incremental sync is deferred to a
+later milestone.
 
 All GitHub fetching (the PR list and every PR's reviews) completes and is
 held in memory *before* any database write begins; persistence then happens
 as a single all-or-nothing transaction — a failure at any point during
 GitHub fetching leaves no partial writes, and a database failure during
-persistence rolls back the entire sync.
+persistence rolls back the entire sync. "Processed" means examined/upserted,
+not newly inserted — running the same sync twice against unchanged GitHub
+data produces the same counts but zero new rows. Re-syncing updates a PR's
+mutable fields (`state`, `title`, `author_login`, `closed_at`, `merged_at`,
+`github_updated_at`) and a review's (`state`, `reviewer_login`,
+`submitted_at`) in place; identity fields (`github_id`, `repository_id`,
+`number`, `pull_request_id`, `github_created_at`) never change. Upserts use
+PostgreSQL's native `INSERT ... ON CONFLICT DO UPDATE` (via
+`sqlalchemy.dialects.postgresql.insert`), not a select-then-branch pattern —
+a deliberate, local exception to the pattern used elsewhere in the codebase,
+chosen for this ingestion workload's idempotency and round-trip-count needs.
 
-Response:
+### Why background sync
+
+A sync makes up to 26 outbound GitHub requests (1 PR list + up to 25 review
+lists) fully serially. Running that inside the HTTP request/response cycle
+ties the request's lifetime to GitHub's availability and latency, and blocks
+the calling thread/connection for however long that takes. Milestone 8 moves
+that work to a Dramatiq worker process: the HTTP request now only creates a
+job row and enqueues it, returning in milliseconds regardless of how long the
+actual sync takes.
+
+### Starting a sync
+
+```bash
+curl -X POST http://127.0.0.1:8000/me/repositories/<repository_id>/sync --cookie "session=..."
+```
+
+Requires authentication and that you track `repository_id`; both a
+nonexistent repository and one you don't track return the same 404. The HTTP
+request never talks to GitHub — it only authorizes, creates a `SyncJob` row,
+and enqueues it.
+
+- **202 Accepted** — a new job was created and queued:
+  ```json
+  {
+    "job_id": "3fae2b1a-...",
+    "repository_id": 1,
+    "status": "queued"
+  }
+  ```
+- **409 Conflict** — a `queued` or `running` job already exists for this
+  *canonical* repository (`{"detail": "Repository sync already in progress."}`,
+  no job id revealed). Because `Repository` is a single global row shared by
+  every user who tracks it, this holds regardless of which user started the
+  active job — returning that other user's job id would create a job the
+  caller couldn't subsequently `GET` (see Authorization below), so it's
+  withheld entirely. This is enforced by a PostgreSQL partial unique index
+  (`repository_id` unique `WHERE status IN ('queued', 'running')`) — the
+  actual correctness boundary even under concurrent requests — with an
+  application-level pre-check only for a cleaner error path.
+- **503 Service Unavailable** — the job was created but Dramatiq/Redis
+  couldn't be reached to enqueue it. The job row is marked `failed`
+  (`safe_error_code: "enqueue_failed"`) rather than left as a phantom
+  `queued` row nothing will ever consume; you can simply retry the request.
+
+### Polling a sync job
+
+```bash
+curl http://127.0.0.1:8000/me/sync-jobs/<job_id> --cookie "session=..."
+```
+
 ```json
 {
+  "job_id": "3fae2b1a-...",
   "repository_id": 1,
-  "full_name": "octocat/hello-world",
+  "status": "succeeded",
   "pull_requests_processed": 25,
-  "reviews_processed": 61
+  "reviews_processed": 61,
+  "created_at": "...",
+  "started_at": "...",
+  "finished_at": "...",
+  "safe_error_code": null,
+  "safe_error_message": null
 }
 ```
-"Processed" means examined/upserted, not newly inserted — running the same
-sync twice against unchanged GitHub data produces the same counts but zero
-new rows (verified by inspecting table row counts, not by the response
-alone). Re-syncing updates a PR's mutable fields (`state`, `title`,
-`author_login`, `closed_at`, `merged_at`, `github_updated_at`) and a review's
-(`state`, `reviewer_login`, `submitted_at`) in place; identity fields
-(`github_id`, `repository_id`, `number`, `pull_request_id`,
-`github_created_at`) never change. Upserts use PostgreSQL's native
-`INSERT ... ON CONFLICT DO UPDATE` (via `sqlalchemy.dialects.postgresql.insert`),
-not a select-then-branch pattern — this is a deliberate, local exception to
-the pattern used elsewhere in the codebase, chosen for this ingestion
-workload's idempotency and round-trip-count needs.
+
+Job states: `queued` → `running` → `succeeded` or `failed` (both terminal).
+There is no `cancelled` state. `safe_error_code`/`safe_error_message` are
+`null` unless `status == "failed"`, and are always drawn from a small fixed
+vocabulary (e.g. `github_rate_limited`, `github_timeout`,
+`github_unavailable`, `database_error`, `unexpected_error`) — never a raw
+exception message or traceback.
+
+**Authorization**: only the job's owner may `GET` it — a nonexistent job id
+and one owned by another user both return the same 404, the same
+never-reveal-existence pattern used for repositories. Job ids are UUIDs
+(not sequential integers) specifically because they're client-facing and
+cross the queue boundary; this deters casual enumeration, but the ownership
+check is what actually prevents unauthorized access.
+
+### Background architecture
+
+```
+POST /sync  ->  authorize + create SyncJob(queued)  ->  enqueue job id (string)  ->  202
+                                                              |
+                                                          Redis queue
+                                                              |
+                                                     Dramatiq worker process
+                                                              |
+                              load SyncJob by id -> GitHub fetch -> persist -> mark succeeded/failed
+```
+
+- **Queue**: Dramatiq + Redis. Dramatiq's `AsyncIO` middleware runs actors as
+  native `async def` functions on a dedicated event-loop thread, so the
+  worker reuses the same async ingestion/httpx/SQLAlchemy code as the rest of
+  the app with no `asyncio.run()` bridging. Redis is used purely as the queue
+  transport — no Dramatiq results backend is configured; job status lives
+  entirely in PostgreSQL (`app/models/sync_job.py`).
+- **No retries**: the actor is registered with `max_retries=0` — one queue
+  delivery is one sync attempt. `run_sync_job` already catches every
+  application failure and marks the job `failed`; a failed sync is retried
+  by the user issuing a new `POST /sync` (safe, since ingestion is
+  idempotent). A narrowly-scoped retry policy may be added in a later
+  milestone.
+- **Queue boundary**: only the job id, as a plain string (`str(job.id)`), ever
+  crosses into Redis — never a `User`/`Repository` ORM object, a database
+  session, or any credential. The worker (`app/worker/tasks.py`) reconstructs
+  everything else from PostgreSQL by that id alone; it never performs
+  authorization itself (that already happened once, synchronously, in the
+  HTTP layer via `get_tracked_repository`) and has no browser session or
+  OAuth token available to it, by construction.
+- **GitHub auth in the worker**: identical to the rest of the app — the
+  configured `GITHUB_TOKEN`, if any, otherwise unauthenticated GitHub access.
+  Private repositories remain out of scope.
+- **Database sessions**: the worker never holds one long-lived session. Each
+  phase (mark the job `running`, perform ingestion, mark the job
+  `succeeded`/`failed`) opens and closes its own short-lived
+  `AsyncSession` from the same `async_session_factory` the rest of the app
+  uses — nothing is held open across the (potentially many, slow) GitHub
+  HTTP calls in between.
+- **HTTP client**: one `httpx.AsyncClient` per sync job, opened with `async
+  with` and closed when the job finishes — simple and self-cleaning, and
+  avoids introducing custom Dramatiq lifecycle middleware just to pool
+  connections across jobs. Worth revisiting only if real throughput demands
+  it.
+
+### Local development (three processes)
+
+```powershell
+# Terminal 1 — PostgreSQL + Redis
+docker compose up -d
+
+# Terminal 2 — FastAPI
+uvicorn app.main:app --reload
+
+# Terminal 3 — Dramatiq worker (one process, one thread)
+dramatiq app.worker.tasks --processes 1 --threads 1
+```
+
+One process/one thread is a deliberate Milestone 8 choice, not an
+architectural limit: PostgreSQL's partial unique index is what actually
+enforces "at most one active sync per repository," not the worker's
+concurrency, so running more processes/threads later is safe. One
+process/thread just keeps GitHub rate-limit usage, and manual observation of
+what's happening, predictable while there's exactly one background job type
+and no need to demonstrate throughput yet. `--watch` is Windows-unsupported
+and not used.
+
+### Known limitations
+
+- **Stuck `running` jobs**: if the worker process dies between marking a job
+  `running` and marking it `succeeded`/`failed`, the row stays `running`
+  indefinitely — nothing currently detects this. Because of the active-job
+  partial unique index, a stuck `running` job also blocks any future sync
+  for that repository until the row is manually updated. No heartbeat or
+  stale-job sweep exists yet; this is an accepted, documented gap, not an
+  oversight.
+- **Lost `job_id`**: if a client never receives its `202` response (e.g. it
+  disconnects mid-request), the job is still safely queued and will still
+  run, but there is currently no endpoint to list a user's jobs to recover
+  the id.
+- **Redis durability**: the local `redis:7-alpine` Compose service has no
+  AOF/RDB persistence configured. A worker restart loses nothing (Redis
+  itself is untouched), but a Redis *container* restart can drop any
+  queued-but-unconsumed job.
+- **No retries, no cancellation, no progress percentage** — all explicitly
+  out of scope for this milestone.
 
 ## Repository engineering metrics
 
@@ -431,7 +590,7 @@ app/
 │   ├── errors.py                 # Centralized domain-exception -> HTTP status mapping
 │   └── routes/                   # API route modules
 │       ├── health.py             # GET /health
-│       ├── repositories.py       # GET /repositories, POST/GET/DELETE /me/repositories, /sync, /metrics
+│       ├── repositories.py       # GET /repositories, POST/GET/DELETE /me/repositories, /sync, /sync-jobs/{id}, /metrics
 │       └── auth.py               # GET /auth/github/login, /callback, /me, POST /auth/logout
 ├── core/
 │   ├── logging.py               # Logging configuration
@@ -450,20 +609,25 @@ app/
 │   ├── session.py               # Session ORM model (token_hash only, FK -> users, CASCADE)
 │   ├── user_repository.py      # UserRepository — composite PK (user_id, repository_id)
 │   ├── pull_request.py         # PullRequest — UNIQUE(github_id), UNIQUE(repository_id, number)
-│   └── pull_request_review.py  # PullRequestReview — UNIQUE(github_id)
+│   ├── pull_request_review.py  # PullRequestReview — UNIQUE(github_id)
+│   └── sync_job.py             # SyncJob — UUID PK, status CHECK, partial unique active-job index
 ├── services/
 │   ├── repositories.py         # resolve_repository(), get_tracked_repository(), track/untrack_repository_for_user()
 │   ├── repository_sync.py      # sync_repository() — bounded PR/review ingestion, Postgres upserts
 │   ├── repository_metrics.py   # get_repository_metrics() — Postgres-only, no GitHub calls
+│   ├── sync_jobs.py            # create_sync_job(), get_own_sync_job(), enqueue_sync_job()
 │   └── auth.py                  # OAuth state, login completion, session validation/deletion
+├── worker/
+│   ├── broker.py                # RedisBroker + AsyncIO middleware, sets the global Dramatiq broker
+│   └── tasks.py                 # run_sync_job() + sync_repository_actor (max_retries=0)
 └── schemas/
     ├── health.py                # Pydantic response models
     ├── repository.py             # RepositoryResponse, RepositoryCreateRequest, TrackedRepositoryResponse
-    ├── sync.py                   # RepositorySyncResponse
+    ├── sync_job.py                # SyncJobCreatedResponse, SyncJobResponse
     ├── metrics.py                 # RepositoryMetricsResponse
     └── user.py                   # UserResponse
 
 alembic/                    # Migration environment and versions
-compose.yaml                # PostgreSQL (dev + test databases)
+compose.yaml                # PostgreSQL (dev + test databases) + Redis (Dramatiq queue transport)
 tests/                      # pytest suite
 ```
