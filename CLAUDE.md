@@ -55,7 +55,10 @@ When completing a milestone:
 
 ## Current Milestone
 
-Milestones 1–9 are complete:
+Milestones 1–9 and 11 are complete (implemented); Milestone 10 (public cloud
+deployment) is implemented but not yet live — see below.
+
+Milestones 1–9:
 
 - Milestone 1: FastAPI backend foundation.
 - Milestone 2: PostgreSQL via Docker Compose, async SQLAlchemy 2.x, Alembic
@@ -338,15 +341,99 @@ flag. No database migration was needed (a plain `Settings` field, no schema
 involved). No render.yaml, deploy, or commit was made for this change
 either.
 
+**Milestone 11 (frontend MVP): implemented, not deployed.** A React +
+TypeScript SPA (Vite, React Router, CSS Modules, Vitest + React Testing
+Library — no Next.js, Tailwind, Redux/Zustand, axios, UI component
+framework, charting library, or frontend-side auth token/localStorage) lives
+in `frontend/`, with `frontend/package-lock.json` committed (`npm ci` in
+both the Dockerfile and CI). Host Node/npm were not installed during
+implementation; every `npm` command (installing, building, testing) was run
+inside a verified-current Node LTS Docker container (`node:24.20.0-slim`,
+confirmed against the Docker Hub registry API rather than guessed) instead
+of skipping verification. `npm run build` runs `tsc -b && vite build`
+(TypeScript checking is part of the build, not a separate step); `npm test`
+runs `vitest run` — one-shot, CI-safe, never a watch mode that hangs a
+pipeline.
+
+Production stays single-origin: FastAPI serves the built SPA. `app/
+frontend.py`'s `configure_frontend(app, dist_path)` is called last in
+`app/main.py`, after every API router — it no-ops entirely (no routes
+registered, no startup failure) when `frontend/dist/index.html` doesn't
+exist, which is what keeps backend-only local dev and the `quality` CI job
+(neither ever runs `npm run build`) completely unaffected. When the dist
+exists, `/assets` is mounted as static files and a catch-all serves
+`index.html` for SPA deep links (e.g. `/repositories/3`), except for
+unmatched paths under a small hand-maintained reserved-prefix set (`auth`,
+`me`, `health`, `ready`, `docs`, `redoc`, `openapi.json`, `assets`), which
+still get a real backend `404`. `repositories` is deliberately **not** in
+that set — `GET /repositories` already wins by ordinary Starlette
+registration-order precedence, and including it broke the frontend's own
+`/repositories/:id` deep link during implementation; caught by a dedicated
+regression test (`tests/test_frontend_serving.py::
+test_bare_repositories_route_still_hits_the_backend_not_the_spa`) before it
+could ship, then re-verified against the live Docker Compose stack. The
+OAuth callback's success redirect (`app/api/routes/auth.py`) changed from
+`/auth/me` to `/`, now that `/` is a real page once the frontend is built;
+`tests/test_auth_routes.py` was updated to match.
+
+Local frontend development runs Vite explicitly on `127.0.0.1:5173`,
+proxying `/auth`, `/me`, `/health`, `/ready`, and `/repositories` to
+`http://127.0.0.1:8000` (`frontend/vite.config.ts`) — same-origin-like
+without CORS, which the application still has none of anywhere. Because
+GitHub's OAuth redirect always lands on the backend's own port, the local
+(dev-only) GitHub OAuth App's callback URL and the local
+`GITHUB_OAUTH_CALLBACK_URL` need to be temporarily pointed at
+`http://127.0.0.1:5173/auth/github/callback` while doing frontend work
+(documented in README); the **production** OAuth App is untouched, keeping
+its existing `https://github-engineering-analytics.onrender.com/
+auth/github/callback`.
+
+The Dockerfile is now multi-stage: a `node:24.20.0-slim` builder stage runs
+`npm ci`/`npm run build` from source and is discarded after `COPY --from`
+pulls only `frontend/dist` into the existing `python:3.14.7-slim-trixie`
+runtime stage — the shipped image contains no Node runtime, no npm, no
+`node_modules`; the same image is still shared by `api`/`worker`/`migrate`.
+`.dockerignore` excludes `frontend/node_modules` and `frontend/dist` so a
+stale local build is never what ships — every image build compiles the
+frontend fresh from source. CI (`.github/workflows/ci.yml`) gained a third
+job, `frontend` (Node 24.20.0, `npm ci`/`npm run build`/`npm test`, no
+backend services — every frontend test mocks `fetch`); `docker-smoke` now
+`needs: [quality, frontend]` and additionally verifies `GET /` returns an
+HTML SPA shell from the running container.
+
+Dashboard (`/`) shows username, tracked repositories, a track-repository
+form, and logout, backed by `GET /auth/me` / `GET,POST /me/repositories` /
+`DELETE /me/repositories/{id}` / `POST /auth/logout` — no GitHub validation
+duplicated in JS; the backend stays authoritative. Repository detail
+(`/repositories/:id`) reads `GET /me/repositories/{id}/metrics` and shows
+"Not enough data" instead of any raw `null`/`NaN`/`undefined`. Sync
+(`useSyncJob` hook) posts to `.../sync`, polls `GET /me/sync-jobs/{job_id}`
+every 2 seconds (injectable interval, not hardcoded, so tests don't need
+fake timers) until terminal or ~2 minutes elapse, and refetches metrics on
+success; a `409` and both distinct `503`s (enqueue failure vs.
+`BACKGROUND_SYNC_ENABLED=false`) render as plain informational text. The
+hosted-demo copy ("Live synchronization is disabled on the hosted demo...")
+is curated UI text triggered only by matching the backend's actual response
+body — React has no hardcoded knowledge of the `BACKGROUND_SYNC_ENABLED`
+flag itself. 16 Vitest/RTL tests pass, covering unauthenticated vs.
+authenticated views, the repository list, metrics (including all-null),
+track/untrack, logout, and the full sync state machine (queued → running →
+succeeded/failed, 409, 503).
+
 Do not implement ARQ, Celery, or RQ; background retries; scheduling/cron;
 GitHub webhooks; job cancellation; job progress percentages; a job-listing
 endpoint; stale-job recovery/heartbeats; Redis persistence tuning; additional
 OAuth providers; password authentication; GitHub GraphQL; commit ingestion;
 issue ingestion; contributors; organizations; team analytics; time-series/
-trend metrics; percentile-based metrics (p90/p95/etc.); frontend/dashboard;
-cloud deployment on AWS/GCP/Azure, Kubernetes, Terraform, Helm, a reverse
-proxy/nginx, a custom domain, a dependency-manager migration, an
-observability platform, role-based authorization, an admin system,
-`render.yaml`/infrastructure-as-code, automatic/CI-triggered deployment, or
-actually creating any Render resource, until their respective milestones or
-until Milestone 10's manual deployment is explicitly performed.
+trend metrics; percentile-based metrics (p90/p95/etc.); a chart/graphing
+library; Playwright/Cypress/MSW or other end-to-end/network-mocking
+frontend test tooling; CORS; frontend-side auth tokens or localStorage-based
+session storage; a state-management library (Redux/Zustand/TanStack Query);
+a general-purpose SPA routing/static-file framework beyond
+`configure_frontend()`; cloud deployment on AWS/GCP/Azure, Kubernetes,
+Terraform, Helm, a reverse proxy/nginx, a custom domain, a dependency-manager
+migration, an observability platform, role-based authorization, an admin
+system, `render.yaml`/infrastructure-as-code, automatic/CI-triggered
+deployment, or actually creating any Render resource, until their respective
+milestones or until Milestone 10's manual deployment is explicitly
+performed.

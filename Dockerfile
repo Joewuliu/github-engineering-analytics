@@ -1,3 +1,22 @@
+# --- Frontend build stage -------------------------------------------------
+# Verified against the Docker Hub registry API at implementation time
+# (node:24.20.0-slim, current Node LTS, pulls successfully). Entirely
+# discarded after the COPY --from below -- the final image contains no Node
+# runtime, no npm, no node_modules. Frontend assets are always built fresh
+# from source here; a stale local frontend/dist is never the source of
+# production assets (frontend/dist is dockerignored from the build context).
+FROM node:24.20.0-slim AS frontend-builder
+
+WORKDIR /frontend
+
+COPY frontend/package.json frontend/package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci
+
+COPY frontend/ ./
+RUN npm run build
+
+# --- Python runtime stage ---------------------------------------------------
 # Verified against the Docker Hub registry API at implementation time
 # (python:3.14.7-slim-trixie pulls successfully; base image has no curl/wget/
 # gcc and runs as root by default -- both addressed below). No dependency
@@ -30,6 +49,14 @@ COPY alembic.ini ./
 # context, so it cannot leak into a layer or carry a secret.
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install .
+
+# Built frontend only -- source, node_modules, and the Node toolchain that
+# produced it never enter this stage at all. app/frontend.py serves this
+# directory if present, and simply does nothing if it isn't (see its own
+# docstring) -- this COPY is what guarantees it always *is* present in this
+# image specifically, regardless of local/CI backend-only workflows that
+# never run `npm run build`.
+COPY --from=frontend-builder /frontend/dist ./frontend/dist
 
 USER appuser
 

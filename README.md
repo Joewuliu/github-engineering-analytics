@@ -4,7 +4,7 @@ A backend application that connects to GitHub, ingests repository activity,
 and calculates engineering analytics. This project is intended to demonstrate
 production-quality backend engineering practices.
 
-## Current Status: Milestone 10 (in progress) — Public Cloud Deployment
+## Current Status: Milestone 11 (implemented, not deployed) — Frontend MVP
 
 Milestone 1 established the base FastAPI application. Milestone 2 added
 PostgreSQL, async SQLAlchemy 2.x, and Alembic migrations. Milestone 3 added
@@ -18,19 +18,21 @@ request/response cycle via a Dramatiq background worker and Redis queue.
 Milestone 9 made the existing backend reproducible: the whole stack (API,
 worker, Postgres, Redis) runs through one Docker Compose command, backed by a
 single application image, a dedicated migration step, `/ready` for
-orchestration-aware readiness, and a GitHub Actions CI workflow. **Milestone
-10's code/configuration preparation is implemented — a live public deployment
-is not.** `pool_pre_ping` is enabled for managed-database reliability, cookie
-`Secure` behavior under `APP_ENV=production` is verified by tests, a new
-`BACKGROUND_SYNC_ENABLED` deployment-capability flag (default `true`) lets
-the free public demo — which has no Background Worker, since Render's free
-tier doesn't offer one — safely reject sync requests with `503` instead of
-accepting jobs nothing would ever process, and
-[Production deployment](#production-deployment) below documents the exact
-target architecture and manual setup sequence. The application is not yet
-reachable at a public URL; that requires manually provisioning Render
-resources, which has not been done. GitHub GraphQL, webhooks, scheduling, and
-further analytics still do not exist — those arrive in later milestones.
+orchestration-aware readiness, and a GitHub Actions CI workflow. Milestone
+10's code/configuration preparation for a public Render deployment is
+implemented — `pool_pre_ping` for managed-database reliability, cookie
+`Secure` behavior under `APP_ENV=production`, and a
+`BACKGROUND_SYNC_ENABLED` deployment-capability flag (default `true`) that
+lets a Background-Worker-less deployment safely reject sync requests with
+`503` — documented in [Production deployment](#production-deployment) below.
+**Milestone 11 adds a React + TypeScript frontend, served by FastAPI itself
+at `/` in production (same origin, no CORS) — implemented and passing its
+own test suite, but not yet deployed.** See [Frontend](#frontend) below for
+the local dev workflow, the same-origin serving strategy, and how it's built
+into the Docker image. **The application is not yet reachable at a public
+URL** — that requires manually provisioning Render resources, which has not
+been done. GitHub GraphQL, webhooks, scheduling, and further analytics still
+do not exist — those arrive in later milestones.
 
 ## Quick start
 
@@ -44,15 +46,17 @@ docker compose up --build
 ```
 
 Wait for `api` to report healthy (`docker compose ps`), then visit
-http://127.0.0.1:8000/docs. See [Running the application](#running-the-application)
-for what actually happens during that command, and
-[Option B](#option-b-local-development) for the faster-iteration alternative
-used for active development.
+http://127.0.0.1:8000/ for the frontend (built as part of the image, see
+[Frontend](#frontend)) or http://127.0.0.1:8000/docs for the API directly.
+See [Running the application](#running-the-application) for what actually
+happens during that command, and [Option B](#option-b-local-development) for
+the faster-iteration alternative used for active development.
 
 ## Requirements
 
 - Docker and Docker Compose — the only requirement for the [Quick start](#quick-start) above.
 - Python 3.14+ — only needed for [Option B](#option-b-local-development) (running `uvicorn`/`dramatiq`/`pytest` directly) or contributing.
+- Node.js — only needed for [local frontend development](#local-frontend-development) (Docker builds the frontend for you otherwise).
 
 ## Setup
 
@@ -624,7 +628,7 @@ GET /auth/github/login
   -> user approves
   -> GET /auth/github/callback?code=...&state=...
   -> code_verifier from the cookie is sent alongside the code on token exchange
-  -> 302 to /auth/me, with a session cookie set
+  -> 302 to /, with a session cookie set
 ```
 
 Sessions are server-side: the browser only ever holds a random opaque token
@@ -658,13 +662,151 @@ GITHUB_OAUTH_CLIENT_SECRET=...
 | Endpoint | Auth | Behavior |
 |---|---|---|
 | `GET /auth/github/login` | No | 302 to GitHub; sets a short-lived `oauth_state` cookie |
-| `GET /auth/github/callback` | No | Validates state, exchanges code, upserts the `User`, creates a `Session`, sets the `session` cookie, 302 to `/auth/me` |
+| `GET /auth/github/callback` | No | Validates state, exchanges code, upserts the `User`, creates a `Session`, sets the `session` cookie, 302 to `/` (the frontend dashboard, once built — see [Frontend](#frontend)) |
 | `GET /auth/me` | Yes | Returns the current user; 401 if not authenticated |
 | `POST /auth/logout` | No (idempotent) | Deletes the session server-side and clears the cookie; succeeds even if already logged out |
 
 If GitHub authorization is denied (`error=access_denied`), the callback
 returns `200 {"detail": "GitHub authorization was cancelled."}` rather than
 an error — declining sign-in is not a server failure.
+
+## Frontend
+
+`frontend/` is a React + TypeScript SPA (Vite, React Router, CSS Modules,
+Vitest + React Testing Library — no Redux/Zustand/TanStack Query, no axios,
+no UI framework, no charting library). It talks to the backend with plain
+`fetch` against relative URLs and the existing `HttpOnly` session cookie —
+there is no separate frontend auth token, and nothing is ever read from or
+written to `localStorage`/`sessionStorage` for authentication.
+
+**Production is a single origin.** FastAPI serves the built SPA at `/` and
+its static assets at `/assets/*` (see [SPA serving](#spa-serving) below);
+`/auth/*`, `/me/*`, `/health`, `/ready`, `/docs`, `/redoc`, and
+`/openapi.json` are unchanged, served by the same process on the same port.
+There is no second frontend origin and no CORS configuration anywhere in the
+application — same-origin `fetch` and cookies work without it.
+
+### Local frontend development
+
+Node/npm are only needed for frontend work; the backend workflows above are
+completely unaffected. Two terminals, alongside `db`/`redis`/`api` from
+[Option B](#option-b-local-development):
+
+```bash
+cd frontend
+npm ci          # or `npm install` the first time you add a dependency
+npm run dev     # Vite dev server at http://127.0.0.1:5173
+```
+
+Vite is configured to bind explicitly to `127.0.0.1:5173` and proxy
+`/auth`, `/me`, `/health`, `/ready`, and `/repositories` to
+`http://127.0.0.1:8000` (`frontend/vite.config.ts`), so the app behaves as
+same-origin during local development too, without needing CORS.
+
+**Local OAuth callback, while doing frontend development:** GitHub's OAuth
+redirect always lands the browser on the backend port, not Vite's — so
+sign-in only works end-to-end through Vite if the GitHub OAuth App's
+callback URL is temporarily pointed at the Vite origin. Update your local
+(dev-only) GitHub OAuth App's Authorization callback URL to
+`http://127.0.0.1:5173/auth/github/callback`, and set the matching value in
+your local `.env`:
+
+```
+GITHUB_OAUTH_CALLBACK_URL=http://127.0.0.1:5173/auth/github/callback
+```
+
+then visit `http://127.0.0.1:5173` and sign in there instead of port 8000.
+Switch both back to `http://127.0.0.1:8000/auth/github/callback` when you're
+only working on the backend and not running Vite. **The production GitHub
+OAuth App is untouched by this** — it keeps its existing
+`https://github-engineering-analytics.onrender.com/auth/github/callback`
+callback regardless of local frontend work.
+
+```bash
+npm run build   # tsc project build + vite build -> frontend/dist
+npm test        # vitest run -- one-shot, non-watch, CI-safe
+```
+
+### SPA serving
+
+`app/frontend.py`'s `configure_frontend()` is called last in `app/main.py`,
+after every API router is already registered — Starlette matches routes in
+registration order, so `/auth/*`, `/me/*`, `/health`, `/ready`, `/docs`,
+`/redoc`, `/openapi.json`, and `GET /repositories` all keep precedence over
+the SPA automatically, with no special-casing beyond one small reserved-path
+set used only for *unmatched* paths (see below). It checks whether
+`frontend/dist/index.html` exists:
+
+- **If not** (a backend-only checkout, or the `quality` CI job, which never
+  runs `npm run build`) — nothing is registered at all. No static routes, no
+  catch-all, no startup failure; the backend behaves exactly as it did
+  before Milestone 11.
+- **If so** — `/assets` is mounted as static files, and a catch-all route
+  serves `frontend/dist/index.html` for anything else, which is what makes
+  client-side deep links like `/repositories/3` work: the browser requests
+  that path from the server, gets the SPA shell back, and React Router takes
+  over from there.
+
+An unmatched path under a reserved backend prefix (`auth`, `me`, `health`,
+`ready`, `docs`, `redoc`, `openapi.json`, `assets`) still returns a real
+backend `404` rather than the SPA shell — e.g. `GET /me/not-a-real-route`.
+`repositories` is deliberately *not* in that reserved set: the bare
+`GET /repositories` route already wins by ordinary registration-order
+precedence, while `/repositories/3` is the frontend's own route and must
+fall through to the SPA shell.
+
+### Pages and behavior
+
+- **`/`** — the dashboard (username, tracked repositories, track-repository
+  form, logout) if signed in; the landing page (a real `<a
+  href="/auth/github/login">` link — never fetched via JS) otherwise.
+- **`/repositories/:id`** — bookmarkable repository detail: total/merged
+  pull requests, merge rate as a percentage, median cycle time and median
+  time-to-first-review in human-readable units (minutes/hours/days), a
+  "Not enough data" label instead of any raw `null`/`NaN`, and a sync panel.
+- **Sync**: `POST .../sync` captures the returned `job_id` and polls
+  `GET /me/sync-jobs/{job_id}` every 2 seconds until `succeeded`/`failed` or
+  ~2 minutes elapse, then refetches metrics on success. A `409` (already
+  running) and the two distinct `503`s are all shown as plain informational
+  text, never as a broken-app error state. On the hosted demo specifically
+  (`BACKGROUND_SYNC_ENABLED=false`), the backend's `503` is shown as "Live
+  synchronization is disabled on the hosted demo. The full background worker
+  architecture is implemented and runs in local Docker Compose." — the
+  frontend has no built-in knowledge of that flag; it only ever reacts to
+  what the HTTP response actually says.
+- **Untrack** uses `DELETE /me/repositories/{id}` behind a simple inline
+  confirmation; it never touches the canonical, globally-shared `Repository`
+  row, only the current user's tracking relationship.
+
+### Frontend tests
+
+```bash
+cd frontend
+npm test
+```
+
+Vitest + React Testing Library only (no Playwright/Cypress/MSW). `fetch` is
+mocked per-test with a small declarative helper
+(`frontend/src/testUtils.ts`) rather than a network-mocking library.
+Covers: unauthenticated landing vs. authenticated dashboard, the tracked
+repository list, metrics rendering (including the all-null case), tracking
+a repository (success and error), untracking with confirmation, logout, the
+full sync polling cycle (queued → running → succeeded → refetch), a failed
+sync, a `409` conflict, and the hosted-demo `503` copy.
+
+### Docker and CI
+
+The Dockerfile's frontend build stage (`node:24.20.0-slim`) runs `npm ci`
+and `npm run build` from source and is discarded after `COPY --from` pulls
+only `frontend/dist` into the final Python runtime image — the shipped image
+contains no Node runtime, no npm, and no `node_modules`. `frontend/dist` and
+`frontend/node_modules` are excluded from the Docker build context via
+`.dockerignore`, so a stale local build is never what ends up in the image;
+every image build compiles the frontend fresh. `.github/workflows/ci.yml`
+adds a `frontend` job (Node 24.20.0, `npm ci` / `npm run build` / `npm
+test`, no backend services) alongside `quality`; `docker-smoke` now depends
+on both and additionally verifies that `GET /` returns an HTML SPA shell
+from the running container.
 
 ## Running tests
 
@@ -720,7 +862,10 @@ row. `DELETE /me/repositories/<id>` for one returns 204, its
 
 OAuth login (needs a real browser — GitHub's consent page is interactive):
 1. Visit `http://127.0.0.1:8000/auth/github/login`, approve on GitHub.
-2. You land on `/auth/me`, showing your `github_id`/`github_login`.
+2. You land on `/` — the dashboard if the frontend is built (`GET /auth/me`
+   under the hood), or a plain `404` if it isn't (backend-only checkout);
+   either way, `curl http://127.0.0.1:8000/auth/me --cookie "session=..."`
+   confirms your `github_id`/`github_login`.
 3. DevTools -> Cookies -> confirm `session` is `HttpOnly`.
 4. `docker exec ... psql -d github_analytics -c "select * from users; select * from sessions;"`
    -> confirm rows exist, and that no access token is stored anywhere.
@@ -755,7 +900,7 @@ mypy app
 ## Continuous Integration
 
 `.github/workflows/ci.yml` runs on every pull request and every push to
-`main`, as two jobs:
+`main`, as three jobs:
 
 - **`quality`** — a real PostgreSQL 16 service container (`github_analytics_test`
   only), then `alembic upgrade head`, `alembic check`, a light
@@ -763,20 +908,28 @@ mypy app
   `pytest`, `ruff check .`, `ruff format --check .`, `mypy app`. No Redis
   service — the test suite is deliberately designed not to need one (see
   [Syncing pull requests and reviews](#syncing-pull-requests-and-reviews-background)).
-- **`docker-smoke`** (`needs: quality`) — builds the application image,
-  brings up the *full* `docker compose` stack against a CI-only `.env`
-  (derived from `.env.example`, with placeholder OAuth values — this job
-  never calls GitHub and never performs an OAuth login), polls `/health`
-  until it's up, then verifies `migrate` exited `0`, `worker` is still
-  running, and the Dramatiq actor imports/registers correctly
-  (`docker run --rm <image> python -c "from app.worker.tasks import
-  sync_repository_actor"` — no live Redis needed for that). Always tears
-  down with `docker compose down -v`, even on failure.
+- **`frontend`** — Node 24.20.0 (`actions/setup-node`, npm-cached against
+  `frontend/package-lock.json`), then `npm ci`, `npm run build` (includes
+  TypeScript type checking), `npm test` (Vitest, non-watch). No backend
+  services — every frontend test mocks `fetch` (see
+  [Frontend tests](#frontend-tests)), so nothing here talks to Postgres,
+  Redis, or GitHub.
+- **`docker-smoke`** (`needs: [quality, frontend]`) — builds the application
+  image (including the Node-based frontend build stage), brings up the
+  *full* `docker compose` stack against a CI-only `.env` (derived from
+  `.env.example`, with placeholder OAuth values — this job never calls
+  GitHub and never performs an OAuth login), polls `/health` until it's up,
+  then verifies `GET /` returns the built HTML SPA shell, that `migrate`
+  exited `0`, that `worker` is still running, and that the Dramatiq actor
+  imports/registers correctly (`docker run --rm <image> python -c "from
+  app.worker.tasks import sync_repository_actor"` — no live Redis needed for
+  that). Always tears down with `docker compose down -v`, even on failure.
 
-These are two separate jobs specifically so `docker-smoke`'s own `db`
-service (started by Compose, mapped to host port 5432) never runs
-alongside `quality`'s GitHub Actions Postgres service container (also on
-port 5432) — combining them in one job would conflict.
+`quality` and `docker-smoke` are separate jobs specifically so
+`docker-smoke`'s own `db` service (started by Compose, mapped to host port
+5432) never runs alongside `quality`'s GitHub Actions Postgres service
+container (also on port 5432) — combining them in one job would conflict.
+`frontend` needs no services at all, so it runs independently of both.
 
 ## Useful Docker commands
 
@@ -1015,6 +1168,7 @@ anything.
 app/
 ├── main.py                    # FastAPI app instance, lifespan (DB engine + httpx client)
 ├── config.py                   # Typed settings loaded from environment
+├── frontend.py                 # configure_frontend() -- serves frontend/dist if built, else a no-op
 ├── api/
 │   ├── deps.py                  # get_db, get_github_client, get_github_oauth_client, get_current_user
 │   ├── errors.py                 # Centralized domain-exception -> HTTP status mapping
@@ -1059,9 +1213,19 @@ app/
     └── user.py                   # UserResponse
 
 alembic/                    # Migration environment and versions
-Dockerfile                  # Single application image, used by migrate/api/worker
+frontend/                   # React + TypeScript SPA (Vite, React Router, CSS Modules)
+├── src/
+│   ├── main.tsx / App.tsx         # Entry point + routing (/ and /repositories/:id)
+│   ├── api/                        # client.ts (typed fetch wrapper), types.ts
+│   ├── hooks/                      # useAuth.ts, useSyncJob.ts (polling state machine)
+│   ├── pages/                      # LandingPage, DashboardPage, RepositoryDetailPage
+│   ├── components/                 # Button, Card, Badge, Spinner, MetricCard, ...
+│   └── styles/                     # tokens.css, global.css
+├── package.json / package-lock.json
+└── vite.config.ts                  # dev server on 127.0.0.1:5173, proxies to :8000
+Dockerfile                  # Node build stage (frontend) + Python runtime stage, used by migrate/api/worker
 .dockerignore
 compose.yaml                # db, redis, migrate, api, worker
-.github/workflows/ci.yml    # quality job + docker-smoke job
-tests/                      # pytest suite
+.github/workflows/ci.yml    # quality job + frontend job + docker-smoke job
+tests/                      # pytest suite (incl. tests/test_frontend_serving.py)
 ```

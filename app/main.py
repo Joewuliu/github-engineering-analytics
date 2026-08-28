@@ -1,6 +1,7 @@
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import httpx
 from fastapi import FastAPI
@@ -10,6 +11,7 @@ from app.api.routes import auth, health, repositories
 from app.config import get_settings
 from app.core.logging import configure_logging
 from app.db.session import engine
+from app.frontend import configure_frontend
 
 logger = logging.getLogger(__name__)
 
@@ -39,3 +41,8 @@ register_exception_handlers(app)
 app.include_router(health.router)
 app.include_router(repositories.router)
 app.include_router(auth.router)
+
+# Registered last, deliberately -- see app/frontend.py. A no-op when
+# frontend/dist hasn't been built (backend-only local dev, the `quality` CI
+# job), so this never gates whether the app can start.
+configure_frontend(app, Path(__file__).resolve().parent.parent / "frontend" / "dist")

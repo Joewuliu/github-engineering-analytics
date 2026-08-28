@@ -61,8 +61,34 @@ jobs:
       - name: mypy
         run: mypy app
 
+  frontend:
+    runs-on: ubuntu-latest
+    # No backend services here at all -- frontend build/tests are fully
+    # offline (fetch is mocked in every test, see src/testUtils.ts), same
+    # "no live dependency needed" spirit as the backend's own test suite.
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.20.0"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build (includes TypeScript type checking)
+        run: npm run build
+
+      - name: Test
+        run: npm test
+
   docker-smoke:
-    needs: quality
+    needs: [quality, frontend]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -100,6 +126,13 @@ jobs:
 
       - name: Show service state
         run: docker compose ps
+
+      - name: Verify the frontend SPA shell is served at /
+        run: |
+          content_type=$(curl -s -o /tmp/root.html -w '%{content_type}' http://127.0.0.1:8000/)
+          echo "content-type: $content_type"
+          echo "$content_type" | grep -q 'text/html'
+          grep -q '<div id="root">' /tmp/root.html
 
       - name: Verify migrate exited successfully
         run: |

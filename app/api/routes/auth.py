@@ -97,7 +97,12 @@ async def github_callback(
     settings = get_settings()
     _, raw_token, _ = await complete_github_login(code, code_verifier, db, oauth_client)
 
-    response = RedirectResponse(url="/auth/me", status_code=status.HTTP_302_FOUND)
+    # "/" (the frontend's own root), not "/auth/me" -- once signed in, a
+    # user should land on the actual dashboard, which calls GET /auth/me
+    # itself on mount, not on a raw JSON page. Correct whether or not a
+    # frontend build is present: with no frontend/dist, "/" simply falls
+    # through to a normal 404 (see app/frontend.py), no worse than before.
+    response = RedirectResponse(url="/", status_code=status.HTTP_302_FOUND)
     response.set_cookie(
         SESSION_COOKIE_NAME,
         raw_token,

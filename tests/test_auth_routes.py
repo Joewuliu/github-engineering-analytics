@@ -72,6 +72,11 @@ async def test_github_login_redirects_to_github(
     assert len(query["state"][0]) >= 32
     assert "code_challenge" in query
     assert query["code_challenge_method"] == ["S256"]
+    # Forces GitHub's account picker. Our logout only destroys our own
+    # server-side session -- it can't and doesn't touch the user's github.com
+    # session or prior OAuth grant -- so without this, GitHub would silently
+    # reuse both and a post-logout sign-in could look like a no-op.
+    assert query["prompt"] == ["select_account"]
 
 
 async def test_github_login_sets_oauth_state_cookie(
@@ -167,7 +172,9 @@ async def test_callback_valid_flow_creates_session_and_redirects(
     )
 
     assert response.status_code == 302
-    assert response.headers["location"] == "/auth/me"
+    # "/" -- the frontend's own root, not the raw /auth/me JSON endpoint --
+    # so a signed-in user lands on the actual dashboard. See Milestone 11.
+    assert response.headers["location"] == "/"
 
     set_cookie_headers = response.headers.get_list("set-cookie")
     session_cookie = next(h for h in set_cookie_headers if h.startswith("session="))

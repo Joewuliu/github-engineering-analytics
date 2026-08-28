@@ -48,6 +48,12 @@ class GitHubOAuthClient:
             "state": state,
             "code_challenge": code_challenge,
             "code_challenge_method": "S256",
+            # Our logout only destroys our own server-side session -- it never
+            # touches the user's github.com session or their prior OAuth grant.
+            # Without this, GitHub silently reuses both, so a fresh sign-in
+            # right after logout can look like logout did nothing. This forces
+            # GitHub's account picker instead.
+            "prompt": "select_account",
         }
         return f"{_AUTHORIZE_URL}?{urlencode(params)}"
 
