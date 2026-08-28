@@ -4,7 +4,9 @@ A backend application that connects to GitHub, ingests repository activity,
 and calculates engineering analytics. This project is intended to demonstrate
 production-quality backend engineering practices.
 
-## Current Status: Milestone 11 (implemented, not deployed) — Frontend MVP
+## Current Status: Milestone 11 (implemented and deployed) — Frontend MVP
+
+**Live demo: https://github-engineering-analytics.onrender.com/**
 
 Milestone 1 established the base FastAPI application. Milestone 2 added
 PostgreSQL, async SQLAlchemy 2.x, and Alembic migrations. Milestone 3 added
@@ -18,21 +20,30 @@ request/response cycle via a Dramatiq background worker and Redis queue.
 Milestone 9 made the existing backend reproducible: the whole stack (API,
 worker, Postgres, Redis) runs through one Docker Compose command, backed by a
 single application image, a dedicated migration step, `/ready` for
-orchestration-aware readiness, and a GitHub Actions CI workflow. Milestone
-10's code/configuration preparation for a public Render deployment is
-implemented — `pool_pre_ping` for managed-database reliability, cookie
-`Secure` behavior under `APP_ENV=production`, and a
-`BACKGROUND_SYNC_ENABLED` deployment-capability flag (default `true`) that
-lets a Background-Worker-less deployment safely reject sync requests with
-`503` — documented in [Production deployment](#production-deployment) below.
-**Milestone 11 adds a React + TypeScript frontend, served by FastAPI itself
-at `/` in production (same origin, no CORS) — implemented and passing its
-own test suite, but not yet deployed.** See [Frontend](#frontend) below for
-the local dev workflow, the same-origin serving strategy, and how it's built
-into the Docker image. **The application is not yet reachable at a public
-URL** — that requires manually provisioning Render resources, which has not
-been done. GitHub GraphQL, webhooks, scheduling, and further analytics still
-do not exist — those arrive in later milestones.
+orchestration-aware readiness, and a GitHub Actions CI workflow. **Milestone
+10's Render deployment is complete** — `pool_pre_ping` for managed-database
+reliability, cookie `Secure` behavior under `APP_ENV=production`, and a
+`BACKGROUND_SYNC_ENABLED` deployment-capability flag are live in production
+exactly as documented in [Production deployment](#production-deployment)
+below. **Milestone 11's React + TypeScript frontend is also live**, served by
+FastAPI itself at `/` (same origin, no CORS) — see [Frontend](#frontend)
+below for the local dev workflow and how it's built into the Docker image.
+
+**The hosted demo intentionally has background synchronization disabled**
+(`BACKGROUND_SYNC_ENABLED=false`) because it runs on Render's free tier,
+which has no persistent Background Worker instance type — see
+[Background sync capability flag](#background-sync-capability-flag) and
+[Frontend](#frontend) below. Signing in and tracking repositories both work
+normally on the live demo; a *newly* tracked repository will show `0`/"Not
+enough data" metrics until it has actually been synced, and on this
+deployment nothing runs `POST .../sync` for it automatically, so a repository
+only shows real metrics if the production database already contains
+previously-ingested pull request/review data for it. The complete Redis +
+Dramatiq background-sync architecture is fully implemented and exercised
+today, just not on this free deployment — it runs end-to-end locally via
+`docker compose up --build` (see [Running the application](#running-the-application)).
+GitHub GraphQL, webhooks, scheduling, and further analytics still do not
+exist — those arrive in later milestones.
 
 ## Quick start
 
@@ -679,12 +690,26 @@ no UI framework, no charting library). It talks to the backend with plain
 there is no separate frontend auth token, and nothing is ever read from or
 written to `localStorage`/`sessionStorage` for authentication.
 
-**Production is a single origin.** FastAPI serves the built SPA at `/` and
-its static assets at `/assets/*` (see [SPA serving](#spa-serving) below);
-`/auth/*`, `/me/*`, `/health`, `/ready`, `/docs`, `/redoc`, and
-`/openapi.json` are unchanged, served by the same process on the same port.
-There is no second frontend origin and no CORS configuration anywhere in the
-application — same-origin `fetch` and cookies work without it.
+**Live at https://github-engineering-analytics.onrender.com/.** Production
+is a single origin: FastAPI serves the built SPA at `/` and its static
+assets at `/assets/*` (see [SPA serving](#spa-serving) below); `/auth/*`,
+`/me/*`, `/health`, `/ready`, `/docs`, `/redoc`, and `/openapi.json` are
+unchanged, served by the same process on the same port. There is no second
+frontend origin and no CORS configuration anywhere in the application —
+same-origin `fetch` and cookies work without it.
+
+Signing in and tracking repositories both work normally on the live demo.
+**Background synchronization does not** — the hosted demo intentionally runs
+with `BACKGROUND_SYNC_ENABLED=false`, because it runs on Render's free tier,
+which has no persistent Background Worker instance type (see
+[Background sync capability flag](#background-sync-capability-flag)). A
+newly tracked repository will show `0`/"Not enough data" metrics on this
+deployment, since nothing there ever runs a sync for it — a repository only
+shows real metrics if the production database already contains data from a
+prior ingestion. The complete Redis + Dramatiq synchronization architecture
+is fully implemented and does run, end-to-end, locally via
+`docker compose up --build` — it just isn't provisioned on this particular
+free-tier deployment.
 
 ### Local frontend development
 
@@ -946,13 +971,12 @@ docker compose down -v               # stop and remove containers AND the pgdata
 
 ## Production deployment
 
-**Production deployment target: Render.** This section documents the
-prepared architecture and manual setup sequence; the application has not
-been deployed yet, and there is no live URL. Local development is
-unaffected either way — it remains exactly the Docker Compose workflow
-described above (Option A/Option B). Production does not reuse
-`compose.yaml`'s `db`/`redis` containers at all; it uses Render's own
-managed services.
+**Deployed on Render: https://github-engineering-analytics.onrender.com/.**
+This section documents the deployed architecture and the manual setup
+sequence that was followed to get there. Local development is unaffected
+either way — it remains exactly the Docker Compose workflow described above
+(Option A/Option B). Production does not reuse `compose.yaml`'s `db`/`redis`
+containers at all; it uses Render's own managed services.
 
 ### Architecture
 
@@ -1159,8 +1183,9 @@ anything.
   may codify the proven configuration as a Blueprint.
 - **Auto-deploy is off** — pushes to `main` do not currently redeploy
   either service; deploys are triggered manually from the Render dashboard.
-- **No custom domain** — the production URL, once deployed, will be
-  Render's provided `*.onrender.com` HTTPS hostname.
+- **No custom domain** — the production URL is Render's provided
+  `*.onrender.com` HTTPS hostname:
+  https://github-engineering-analytics.onrender.com/.
 
 ## Project structure
 

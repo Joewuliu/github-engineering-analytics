@@ -55,8 +55,9 @@ When completing a milestone:
 
 ## Current Milestone
 
-Milestones 1–9 and 11 are complete (implemented); Milestone 10 (public cloud
-deployment) is implemented but not yet live — see below.
+Milestones 1–11 are complete, including Milestone 10's Render deployment —
+the application is live at https://github-engineering-analytics.onrender.com/
+— see below for details on each milestone.
 
 Milestones 1–9:
 
@@ -271,11 +272,10 @@ Milestones 1–9:
   proxy/HTTPS, no cloud deployment, and no worker HTTP health check
   (deliberately) were introduced.
 
-**Milestone 10 (public cloud deployment): deployment preparation
-implemented; live Render deployment pending manual provisioning/
-verification.** Milestone 10 is not complete — no Render resources have
-been created, and there is no live URL. What's implemented so far:
-`app/db/session.py`'s engine now sets `pool_pre_ping=True` (a cheap
+**Milestone 10 (public cloud deployment): complete — deployed to Render.**
+Live URL: **https://github-engineering-analytics.onrender.com/**. What was
+implemented and is now live: `app/db/session.py`'s engine sets
+`pool_pre_ping=True` (a cheap
 liveness check before handing out a pooled connection, so a managed
 Postgres instance silently dropping an idle connection surfaces as a
 transparent reconnect rather than a confusing mid-request failure) —
@@ -312,11 +312,11 @@ manually before being codified — see README), no GitHub Actions deploy
 step or Render credentials in CI, auto-deploy left OFF on both services.
 The CI workflow itself is unchanged from Milestone 9.
 
-**Deployment decision, still within Milestone 10 preparation (live
-deployment still in progress, not complete)**: the free public Render demo
-will run on free resources and will have **no Background Worker at all** —
-Render's free tier has no Background Worker instance type, so provisioning
-one there would require a paid tier. To stop the free demo from accepting
+**Deployment decision, in effect on the live deployment**: the free public
+Render demo runs on free resources and has **no Background Worker at all**
+— Render's free tier has no Background Worker instance type, so provisioning
+one there would require a paid tier. This remains the deployed configuration
+today. To stop the free demo from accepting
 sync requests it could never process, a new deployment-capability setting,
 `background_sync_enabled: bool = True` (env var `BACKGROUND_SYNC_ENABLED`,
 default `true`), was added to `app/config.py` — deliberately not inferred
@@ -341,7 +341,10 @@ flag. No database migration was needed (a plain `Settings` field, no schema
 involved). No render.yaml, deploy, or commit was made for this change
 either.
 
-**Milestone 11 (frontend MVP): implemented, not deployed.** A React +
+**Milestone 11 (frontend MVP): implemented and deployed.** Live at
+**https://github-engineering-analytics.onrender.com/**, served by FastAPI
+itself (same origin, no CORS) — see the Milestone 10 entry above for the
+live URL and deployed architecture this frontend now rides on. A React +
 TypeScript SPA (Vite, React Router, CSS Modules, Vitest + React Testing
 Library — no Next.js, Tailwind, Redux/Zustand, axios, UI component
 framework, charting library, or frontend-side auth token/localStorage) lives
