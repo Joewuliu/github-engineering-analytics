@@ -309,6 +309,35 @@ manually before being codified — see README), no GitHub Actions deploy
 step or Render credentials in CI, auto-deploy left OFF on both services.
 The CI workflow itself is unchanged from Milestone 9.
 
+**Deployment decision, still within Milestone 10 preparation (live
+deployment still in progress, not complete)**: the free public Render demo
+will run on free resources and will have **no Background Worker at all** —
+Render's free tier has no Background Worker instance type, so provisioning
+one there would require a paid tier. To stop the free demo from accepting
+sync requests it could never process, a new deployment-capability setting,
+`background_sync_enabled: bool = True` (env var `BACKGROUND_SYNC_ENABLED`,
+default `true`), was added to `app/config.py` — deliberately not inferred
+from `app_env`, since `APP_ENV=production` does not itself mean sync is
+unavailable; only a deployment with no worker does. The check lives in
+`create_sync_job()` (`app/services/sync_jobs.py`), running immediately
+after `get_tracked_repository()` (so nonexistent/untracked repositories
+still return the identical 404 either way — the flag is never a way to
+probe repository existence) but before the active-job check, before any
+`SyncJob` row is created, and before `enqueue()` is ever called. A new
+`BackgroundSyncDisabledError`, mapped centrally in `app/api/errors.py` like
+every other domain exception, produces `503
+{"detail": "Background synchronization is unavailable in this
+deployment."}` — deliberately deployment-neutral wording, no provider name.
+Local development, Docker Compose (both Option A and Option B), and the
+full test suite are all unaffected — the flag's default is `true`, so the
+complete API → Redis → Dramatiq worker → GitHub → PostgreSQL architecture
+remains exactly as Milestone 8 designed and continues to be exercised by
+the existing worker/job tests. `GET /me/sync-jobs/{job_id}` and
+`GET /me/repositories/{id}/metrics` are both completely untouched by this
+flag. No database migration was needed (a plain `Settings` field, no schema
+involved). No render.yaml, deploy, or commit was made for this change
+either.
+
 Do not implement ARQ, Celery, or RQ; background retries; scheduling/cron;
 GitHub webhooks; job cancellation; job progress percentages; a job-listing
 endpoint; stale-job recovery/heartbeats; Redis persistence tuning; additional

@@ -21,7 +21,11 @@ single application image, a dedicated migration step, `/ready` for
 orchestration-aware readiness, and a GitHub Actions CI workflow. **Milestone
 10's code/configuration preparation is implemented — a live public deployment
 is not.** `pool_pre_ping` is enabled for managed-database reliability, cookie
-`Secure` behavior under `APP_ENV=production` is verified by tests, and
+`Secure` behavior under `APP_ENV=production` is verified by tests, a new
+`BACKGROUND_SYNC_ENABLED` deployment-capability flag (default `true`) lets
+the free public demo — which has no Background Worker, since Render's free
+tier doesn't offer one — safely reject sync requests with `503` instead of
+accepting jobs nothing would ever process, and
 [Production deployment](#production-deployment) below documents the exact
 target architecture and manual setup sequence. The application is not yet
 reachable at a public URL; that requires manually provisioning Render
@@ -390,6 +394,43 @@ and enqueues it.
   couldn't be reached to enqueue it. The job row is marked `failed`
   (`safe_error_code: "enqueue_failed"`) rather than left as a phantom
   `queued` row nothing will ever consume; you can simply retry the request.
+- **503 Service Unavailable** — `BACKGROUND_SYNC_ENABLED=false` on this
+  deployment (`{"detail": "Background synchronization is unavailable in
+  this deployment."}`). Distinct from the previous case: here nothing is
+  created at all — no `SyncJob` row, no enqueue attempt, no Redis touched.
+  See [Background sync capability flag](#background-sync-capability-flag)
+  below.
+
+### Background sync capability flag
+
+```
+BACKGROUND_SYNC_ENABLED=true   # default -- local dev, Docker Compose, tests
+BACKGROUND_SYNC_ENABLED=false  # only a deployment with no worker provisioned
+```
+
+This is a **deployment-capability flag, not an environment flag** —
+`APP_ENV=production` does not itself disable sync; a deployment with no
+Background Worker able to process jobs does. The check
+(`create_sync_job()` in `app/services/sync_jobs.py`) runs *after*
+`get_tracked_repository()` (so a nonexistent or untracked repository still
+returns the same 404 either way — the flag is never a way to probe
+repository existence) but *before* the active-job check, before any
+`SyncJob` row is created, and before `enqueue()` is ever called. Everything
+else — GitHub OAuth login, `/auth/me`, tracking a repository, listing
+tracked repositories, `GET /me/sync-jobs/{job_id}` for previously-created
+jobs, and `GET /me/repositories/{id}/metrics` — is completely unaffected;
+only *starting a new* sync is gated.
+
+- **Full local architecture** (Docker Compose, both Option A and Option B):
+  API → Redis → Dramatiq worker → GitHub → PostgreSQL, exactly as Milestone
+  8 designed, with `BACKGROUND_SYNC_ENABLED` at its default `true`.
+- **Free hosted demo**: intentionally sets `BACKGROUND_SYNC_ENABLED=false`,
+  because the free tier this demo runs on has no persistent Background
+  Worker provisioned (Render's free tier has no Background Worker instance
+  type). This is a **deployment limitation, not a missing or unfinished
+  feature** — the full worker/queue architecture remains implemented and
+  tested exactly as before; provisioning a worker and setting the flag back
+  to `true` restores production sync with no code or architecture change.
 
 ### Polling a sync job
 
@@ -773,7 +814,15 @@ image runs* differ:
   Milestone 8/9. No public port, no HTTP health server — deliberately, for
   the same reason as local Docker Compose (see
   [Known limitations (Docker/CI)](#known-limitations-docker-ci) above);
-  independently restartable from the Web Service.
+  independently restartable from the Web Service. **The free public demo
+  does not provision this** — Render's free tier has no Background Worker
+  instance type — so the demo's Web Service instead sets
+  `BACKGROUND_SYNC_ENABLED=false` (see
+  [Background sync capability flag](#background-sync-capability-flag)):
+  `POST /me/repositories/{id}/sync` returns `503` rather than accepting a
+  job nothing would ever process. A paid deployment that provisions this
+  Background Worker and sets the flag back to `true` restores background
+  sync with no code or architecture change.
 - **Render Postgres** — durable, managed relational storage. Replaces
   `compose.yaml`'s local `db` container in production; nothing else about
   the SQLAlchemy/Alembic architecture changes.
@@ -837,6 +886,11 @@ DATABASE_URL=<Render-generated host/credentials, but the SQLAlchemy+psycopg3
               dialect scheme: postgresql+psycopg://user:password@host/database>
 REDIS_URL=<Render Key Value internal connection URL>
 
+# false on the free Web Service (no Background Worker provisioned -- see
+# "Background sync capability flag"); a paid deployment that adds a
+# Background Worker sets this true instead.
+BACKGROUND_SYNC_ENABLED=false
+
 GITHUB_OAUTH_CALLBACK_URL=https://<render-host>/auth/github/callback
 GITHUB_OAUTH_CLIENT_ID=<production OAuth App client id>
 GITHUB_OAUTH_CLIENT_SECRET=<production OAuth App client secret>
@@ -885,10 +939,13 @@ still needs *a* token). Never shared here or pasted into chat.
 ### Production GitHub token
 
 A public-repository, read-only, **fine-grained personal access token**,
-configured as `GITHUB_TOKEN` on both the API and worker services (both make
-outbound GitHub REST calls — tracking a repository from the API, syncing
-from the worker) — this avoids GitHub's unauthenticated 60-requests/hour
-limit. `GITHUB_TOKEN` stays optional for local development, as today.
+configured as `GITHUB_TOKEN` on the API service (and on a Background Worker
+too, for any deployment that provisions one — both make outbound GitHub
+REST calls: tracking a repository from the API, syncing from the worker) —
+this avoids GitHub's unauthenticated 60-requests/hour limit. Still useful
+on the free demo even with `BACKGROUND_SYNC_ENABLED=false`, since tracking
+a repository and refreshing its metadata still call GitHub from the API.
+`GITHUB_TOKEN` stays optional for local development, as today.
 
 To create it (perform this yourself — do not paste the token value back):
 1. https://github.com/settings/personal-access-tokens/new
@@ -920,23 +977,31 @@ To create it (perform this yourself — do not paste the token value back):
 
 ### Cost
 
-The production architecture requires paid resources for the durable
-worker/data configuration; verify current Render pricing before
-provisioning. Concretely, at the time this was written: Render Background
-Workers have no free instance type; Pre-Deploy Commands require a paid
-web/private/worker service tier; a free Render Postgres instance is not
-appropriate for durable portfolio data because its lifecycle is
-time-limited; genuine Key Value persistence requires a paid tier. No dollar
-figures are hard-coded here since Render's pricing changes — check the
-Render dashboard directly before creating any resource.
+The production architecture requires paid resources for a durable data
+configuration even without a Background Worker; verify current Render
+pricing before provisioning. Concretely, at the time this was written:
+Render Background Workers have no free instance type at all (part of why
+the free public demo runs without one — see
+[Background sync capability flag](#background-sync-capability-flag));
+Pre-Deploy Commands require a paid web/private/worker service tier; a free
+Render Postgres instance is not appropriate for durable portfolio data
+because its lifecycle is time-limited; genuine Key Value persistence
+requires a paid tier. No dollar figures are hard-coded here since Render's
+pricing changes — check the Render dashboard directly before provisioning
+anything.
 
 ### Known limitations
 
-- **Worker-crash-mid-job**: unchanged from Milestone 8/9 — if the worker
-  process is restarted (crash, redeploy, OOM) while a `SyncJob` is
-  `running`, that row stays `running` indefinitely; no heartbeat/stale-job
-  recovery exists. Deploying to Render does not change this behavior, only
-  where it can happen.
+- **No Background Worker on the free demo, by design**: `BACKGROUND_SYNC_ENABLED=false`
+  there, so `POST /me/repositories/{id}/sync` returns `503` rather than
+  accepting a job. This is a deployment-tier limitation, not an unfinished
+  feature — the full worker/queue architecture is implemented, tested, and
+  runs today in local Docker Compose; see
+  [Background sync capability flag](#background-sync-capability-flag).
+- **Worker-crash-mid-job**: unchanged from Milestone 8/9, and only relevant
+  to a deployment that *does* run a worker — if the worker process is
+  restarted (crash, redeploy, OOM) while a `SyncJob` is `running`, that row
+  stays `running` indefinitely; no heartbeat/stale-job recovery exists.
 - **No `render.yaml` yet** — deployment is manual; a later hardening step
   may codify the proven configuration as a Blueprint.
 - **Auto-deploy is off** — pushes to `main` do not currently redeploy

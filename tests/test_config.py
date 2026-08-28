@@ -23,3 +23,19 @@ def test_settings_env_var_override(monkeypatch) -> None:
     assert settings.app_name == "Custom Name"
     assert settings.app_env == "production"
     assert settings.log_level == "DEBUG"
+
+
+def test_settings_background_sync_enabled_defaults_to_true(monkeypatch) -> None:
+    monkeypatch.delenv("BACKGROUND_SYNC_ENABLED", raising=False)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.background_sync_enabled is True
+
+
+def test_settings_background_sync_enabled_env_var_override(monkeypatch) -> None:
+    monkeypatch.setenv("BACKGROUND_SYNC_ENABLED", "false")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.background_sync_enabled is False

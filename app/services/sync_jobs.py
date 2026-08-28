@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.models.sync_job import SyncJob
 from app.models.user import User
 from app.services.repositories import get_tracked_repository
@@ -27,6 +28,12 @@ class SyncJobEnqueueError(Exception):
 
 class SyncJobNotFoundError(Exception):
     """No SyncJob with this id is visible to the current user."""
+
+
+class BackgroundSyncDisabledError(Exception):
+    """This deployment has background_sync_enabled=False (no worker capable
+    of processing jobs), so sync requests are rejected before anything is
+    created or enqueued."""
 
 
 async def enqueue_sync_job(job_id: UUID) -> None:
@@ -53,8 +60,18 @@ async def create_sync_job(
     data. If the job commits but enqueueing fails, the job is marked
     failed (not left as a queued job nothing will ever consume) and
     SyncJobEnqueueError is raised.
+
+    The background_sync_enabled capability check runs after repository
+    tracking is verified (so a nonexistent/untracked repository still
+    reveals nothing beyond the usual 404 -- the flag is never a way to
+    probe repository existence) but before any other work: no active-job
+    query, no SyncJob row, no enqueue call, on a deployment with no worker
+    able to process one anyway.
     """
     repository = await get_tracked_repository(repository_id, user, db)
+
+    if not get_settings().background_sync_enabled:
+        raise BackgroundSyncDisabledError
 
     existing_active = await db.scalar(
         select(SyncJob).where(

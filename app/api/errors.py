@@ -26,6 +26,7 @@ from app.services.auth import (
 from app.services.readiness import DatabaseNotReadyError
 from app.services.repositories import RepositoryAlreadyTrackedError, RepositoryNotTrackedError
 from app.services.sync_jobs import (
+    BackgroundSyncDisabledError,
     RepositorySyncAlreadyActiveError,
     SyncJobEnqueueError,
     SyncJobNotFoundError,
@@ -52,6 +53,10 @@ _ERROR_MAPPING: dict[type[Exception], tuple[int, str]] = {
     SyncJobEnqueueError: (503, "Could not schedule the sync job. Try again later."),
     SyncJobNotFoundError: (404, "Sync job not found."),
     DatabaseNotReadyError: (503, "Service not ready."),
+    BackgroundSyncDisabledError: (
+        503,
+        "Background synchronization is unavailable in this deployment.",
+    ),
 }
 
 # These are the pre-token-exchange callback validation failures: state

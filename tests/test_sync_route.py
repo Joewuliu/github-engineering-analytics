@@ -1,9 +1,13 @@
+from collections.abc import Callable
 from uuid import UUID
 
+import httpx
+import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import Settings
 from app.models.repository import Repository
 from app.models.sync_job import SyncJob
 from app.models.user import User
@@ -11,6 +15,15 @@ from app.models.user_repository import UserRepository
 from tests.conftest import FakeEnqueue
 
 AuthClient = tuple[AsyncClient, User]
+StubGitHub = Callable[[Callable[[httpx.Request], httpx.Response]], None]
+
+
+@pytest.fixture
+def background_sync_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "app.services.sync_jobs.get_settings",
+        lambda: Settings(background_sync_enabled=False),
+    )
 
 
 async def _make_user(db_session: AsyncSession, github_id: int, login: str) -> User:
@@ -172,3 +185,93 @@ async def test_sync_after_enqueue_failure_can_be_retried(
     second = await client.post(f"/me/repositories/{repository.id}/sync")
 
     assert second.status_code == 202
+
+
+# ---- background_sync_enabled=False ----------------------------------------
+
+
+async def test_sync_disabled_unauthenticated_still_returns_401(
+    async_client: AsyncClient,
+    stub_enqueue_sync_job: FakeEnqueue,
+    background_sync_disabled: None,
+) -> None:
+    response = await async_client.post("/me/repositories/1/sync")
+
+    assert response.status_code == 401
+
+
+async def test_sync_disabled_nonexistent_repository_still_returns_404(
+    authenticated_client: AuthClient,
+    stub_enqueue_sync_job: FakeEnqueue,
+    background_sync_disabled: None,
+) -> None:
+    client, _user = authenticated_client
+
+    response = await client.post("/me/repositories/999999/sync")
+
+    assert response.status_code == 404
+
+
+async def test_sync_disabled_untracked_repository_still_returns_404(
+    authenticated_client: AuthClient,
+    stub_enqueue_sync_job: FakeEnqueue,
+    db_session: AsyncSession,
+    background_sync_disabled: None,
+) -> None:
+    client, _user = authenticated_client
+    owner = await _make_user(db_session, 800003, "owner-2")
+    repository = Repository(github_id=607, full_name="octocat/not-mine-either")
+    await _track(db_session, owner, repository)
+
+    response = await client.post(f"/me/repositories/{repository.id}/sync")
+
+    # Same 404 as the enabled case -- the capability flag never becomes a
+    # way to distinguish "untracked" from "sync unavailable" for a repo
+    # this user doesn't track.
+    assert response.status_code == 404
+
+
+async def test_sync_disabled_tracked_repository_returns_503_with_no_job_created(
+    authenticated_client: AuthClient,
+    stub_enqueue_sync_job: FakeEnqueue,
+    db_session: AsyncSession,
+    background_sync_disabled: None,
+) -> None:
+    client, user = authenticated_client
+    repository = Repository(github_id=608, full_name="octocat/sync-disabled-demo")
+    await _track(db_session, user, repository)
+
+    response = await client.post(f"/me/repositories/{repository.id}/sync")
+
+    assert response.status_code == 503
+    body = response.json()
+    assert body == {"detail": "Background synchronization is unavailable in this deployment."}
+    # Deployment-neutral wording only -- no provider name leaked.
+    assert "render" not in str(body).lower()
+
+    jobs = await db_session.execute(select(SyncJob).where(SyncJob.repository_id == repository.id))
+    assert jobs.scalars().all() == []
+
+    # The capability check short-circuits before enqueue is ever reached.
+    assert stub_enqueue_sync_job.enqueued == []
+
+
+async def test_sync_disabled_never_calls_github(
+    authenticated_client: AuthClient,
+    stub_enqueue_sync_job: FakeEnqueue,
+    stub_github_client: StubGitHub,
+    db_session: AsyncSession,
+    background_sync_disabled: None,
+) -> None:
+    client, user = authenticated_client
+    repository = Repository(github_id=609, full_name="octocat/sync-disabled-no-github")
+    await _track(db_session, user, repository)
+
+    def trap_handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"Disabled sync must never call GitHub: {request.url}")
+
+    stub_github_client(trap_handler)
+
+    response = await client.post(f"/me/repositories/{repository.id}/sync")
+
+    assert response.status_code == 503

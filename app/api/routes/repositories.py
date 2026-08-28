@@ -86,6 +86,14 @@ async def untrack_repository(
     "/me/repositories/{repository_id}/sync",
     response_model=SyncJobCreatedResponse,
     status_code=status.HTTP_202_ACCEPTED,
+    responses={
+        503: {
+            "description": (
+                "Background synchronization is unavailable in this deployment "
+                "(no worker capable of processing sync jobs is configured)."
+            )
+        }
+    },
 )
 async def sync_tracked_repository(
     repository_id: int,
